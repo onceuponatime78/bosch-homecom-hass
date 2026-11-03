@@ -63,7 +63,12 @@ from .coordinator import (
     BoschComModuleCoordinatorRrc2,
     BoschComModuleCoordinatorWddw2,
 )
-from .local_sensor import LOCAL_SENSORS, BoschComLocalSensor, BoschComLocalSourceSensor
+from .local_sensor import (
+    LOCAL_SENSORS,
+    BoschComLocalSensor,
+    BoschComLocalSourceSensor,
+    BoschComLocalSystemInfoSensor,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,6 +109,11 @@ async def async_setup_entry(
             )
             entities.append(
                 BoschComLocalSourceSensor(
+                    coordinator=coordinator, config_entry=config_entry
+                )
+            )
+            entities.append(
+                BoschComLocalSystemInfoSensor(
                     coordinator=coordinator, config_entry=config_entry
                 )
             )

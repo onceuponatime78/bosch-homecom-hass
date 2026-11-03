@@ -59,6 +59,7 @@ from custom_components.bosch_homecom.local_sensor import (
     LOCAL_SENSORS,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
+    BoschComLocalSystemInfoSensor,
     _emon_field,
 )
 
@@ -159,6 +160,8 @@ def _coordinator(hass, entry, device, firmware, *, local=True):
         setattr(bhc, getter, AsyncMock(return_value=None))
     bhc.async_request_bulk = AsyncMock(return_value={})
     local_client = Mock() if local else None
+    if local:
+        local_client.async_get_resource = AsyncMock(return_value=None)
     coordinator = BoschComModuleCoordinatorK40(
         hass, bhc, device, firmware, entry, False, local_client
     )
@@ -1136,10 +1139,60 @@ async def test_local_source_sensor_reports_transport(hass, entry, device, firmwa
 
     sensor = BoschComLocalSourceSensor(coordinator, entry)
     assert sensor.native_value == "local"
-
     coordinator.local_source = "both"
     sensor.set_attr()
     assert sensor.native_value == "both"
+
+
+@pytest.mark.asyncio
+async def test_local_system_info_is_fetched_and_cached(hass, entry, device, firmware):
+    """The full module inventory is read once and retained for the diagnostic sensor."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    info = {
+        "id": "/system/basicInfo",
+        "gatewayId": GATEWAY,
+        "values": [
+            {"ProductName": "Compress CS5800iAW 12 MB", "Ver": "15.00.01"},
+            {"ProductName": "AW 7 OR-S", "ModuleSerialNumber": "module-serial"},
+        ],
+    }
+    coordinator.local_client.async_get_resource.return_value = info
+
+    await coordinator._fetch_local_system_info()
+    await coordinator._fetch_local_system_info()
+
+    coordinator.local_client.async_get_resource.assert_awaited_once_with(
+        "/system/basicInfo"
+    )
+    assert coordinator.local_system_info == info
+
+
+@pytest.mark.asyncio
+async def test_local_system_info_sensor_exposes_dynamic_module_data(
+    hass, entry, device, firmware
+):
+    """Every field and each reported module is preserved as sensor attributes."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    info = {
+        "id": "/system/basicInfo",
+        "gatewayId": GATEWAY,
+        "values": [
+            {"ProductName": "Compress CS5800iAW 12 MB", "Ver": "15.00.01"},
+            {
+                "ProductName": "AW 7 OR-S",
+                "ModuleSerialNumber": "module-serial",
+                "ModuleHwIdentStr": "1234",
+            },
+        ],
+    }
+    coordinator.local_system_info = info
+
+    sensor = BoschComLocalSystemInfoSensor(coordinator, entry)
+
+    assert sensor.native_value == 2
+    assert sensor.extra_state_attributes == info
 
 
 @pytest.mark.asyncio
@@ -1528,6 +1581,10 @@ async def test_setup_without_the_cloud_uses_the_gateway(hass, cloud_error, reaut
         patch(
             "custom_components.bosch_homecom.HomeComK40Local.async_update",
             new=AsyncMock(return_value=local),
+        ),
+        patch(
+            "custom_components.bosch_homecom.HomeComK40Local.async_get_resource",
+            new=AsyncMock(return_value=_basic_info()),
         ),
         patch.object(entry, "async_start_reauth") as start_reauth,
     ):

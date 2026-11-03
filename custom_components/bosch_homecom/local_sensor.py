@@ -289,3 +289,39 @@ class BoschComLocalSourceSensor(CoordinatorEntity, SensorEntity):
         """Handle updated data from the coordinator."""
         self.set_attr()
         self.async_write_ha_state()
+
+
+class BoschComLocalSystemInfoSensor(CoordinatorEntity, SensorEntity):
+    """Expose every module field reported by the gateway's basicInfo resource."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "local_system_info"
+    _attr_icon = "mdi:chip"
+
+    def __init__(self, coordinator, config_entry) -> None:
+        """Initialize the gateway-information sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.unique_id}-local_system_info"
+        self._attr_device_info = coordinator.device_info
+        self._config_entry = config_entry
+
+    @property
+    def native_value(self) -> int | None:
+        """Return the number of module records reported by the gateway."""
+        info = self.coordinator.local_system_info
+        if not isinstance(info, dict):
+            return None
+        modules = info.get("values")
+        return len(modules) if isinstance(modules, list) else 1
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the complete basicInfo response without a fixed field schema."""
+        info = self.coordinator.local_system_info
+        return dict(info) if isinstance(info, dict) else {}
+
+    def _handle_coordinator_update(self) -> None:
+        """Write updated metadata after the coordinator refreshes it."""
+        self.async_write_ha_state()

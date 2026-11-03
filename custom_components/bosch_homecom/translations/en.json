@@ -622,6 +622,9 @@
       "local_data_source": {
         "name": "Data source"
       },
+      "local_system_info": {
+        "name": "Gateway module count"
+      },
       "bacon_air_quality": {
         "name": "Air quality",
         "state": {

@@ -622,6 +622,9 @@
       "local_data_source": {
         "name": "Gegevensbron"
       },
+      "local_system_info": {
+        "name": "Gatewaymoduleaantal"
+      },
       "bacon_air_quality": {
         "name": "Luchtkwaliteit",
         "state": {

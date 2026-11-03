@@ -225,6 +225,8 @@ WDDW2_RECORDINGS_POLL_INTERVAL = timedelta(minutes=5)
 WDDW2_WATER_TODAY_KEY = "dhw_water_today"
 WDDW2_HEALTH_STATUS_PATH = "/system/healthStatus"
 HC_TUNE_POLL_INTERVAL = timedelta(minutes=15)
+LOCAL_SYSTEM_INFO_PATH = "/system/basicInfo"
+LOCAL_SYSTEM_INFO_POLL_INTERVAL = timedelta(hours=24)
 
 # Weather-compensation / underfloor-heating settings of heating circuit hc1,
 # as extra_data key -> (homecom_alt getter, setter). Exposed as number and
@@ -796,6 +798,8 @@ class BoschComModuleCoordinatorK40(
             HomeComK40LocalFirst(local_client, bhc) if local_client else None
         )
         self.local_data = None
+        self.local_system_info: dict | None = None
+        self._last_local_system_info_fetch: datetime | None = None
         self.local_source: str | None = None
         self.local_healthy = False
         self._cloud_failures = 0
@@ -840,6 +844,8 @@ class BoschComModuleCoordinatorK40(
         self.local_data = update.local
         self.local_source = update.source
         self.local_healthy = update.local_healthy
+        if update.local is not None:
+            await self._fetch_local_system_info()
 
         if update.cloud is not None:
             self._cloud_failures = 0
@@ -896,7 +902,39 @@ class BoschComModuleCoordinatorK40(
         self.local_data = local
         self.local_source = "local" if local is not None else None
         self.local_healthy = local is not None
+        if local is not None:
+            await self._fetch_local_system_info()
         return self._local_data_or_fail(local, "No usable cloud token")
+
+    async def _fetch_local_system_info(self) -> None:
+        """Cache the gateway's module inventory for its diagnostic sensor."""
+        if self.local_client is None:
+            return
+        now = dt_util.utcnow()
+        if (
+            self._last_local_system_info_fetch is not None
+            and now - self._last_local_system_info_fetch
+            < LOCAL_SYSTEM_INFO_POLL_INTERVAL
+        ):
+            return
+        try:
+            info = await self.local_client.async_get_resource(LOCAL_SYSTEM_INFO_PATH)
+        except (
+            ApiError,
+            AuthFailedError,
+            InvalidSensorDataError,
+            NotRespondingError,
+            RetryError,
+            TimeoutError,
+        ) as error:
+            _LOGGER.debug(
+                "Device_Id: %s, local system information fetch failed: %s",
+                self.unique_id,
+                error,
+            )
+            return
+        self.local_system_info = info if isinstance(info, dict) else None
+        self._last_local_system_info_fetch = now
 
     def _local_data_or_fail(
         self, local: BHCDeviceK40Local | None, cloud_error: str
