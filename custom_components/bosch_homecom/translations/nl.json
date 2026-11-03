@@ -623,7 +623,10 @@
         "name": "Gegevensbron"
       },
       "local_system_info": {
-        "name": "Gatewaymoduleaantal"
+        "name": "Gatewaymodule-informatie"
+      },
+      "local_module_details": {
+        "name": "Gatewaymodule {module}"
       },
       "bacon_air_quality": {
         "name": "Luchtkwaliteit",

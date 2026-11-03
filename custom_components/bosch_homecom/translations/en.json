@@ -623,7 +623,10 @@
         "name": "Data source"
       },
       "local_system_info": {
-        "name": "Gateway module count"
+        "name": "Gateway module information"
+      },
+      "local_module_details": {
+        "name": "Gateway module {module}"
       },
       "bacon_air_quality": {
         "name": "Air quality",

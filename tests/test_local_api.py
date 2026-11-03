@@ -57,6 +57,7 @@ from custom_components.bosch_homecom.diagnostics import (
 )
 from custom_components.bosch_homecom.local_sensor import (
     LOCAL_SENSORS,
+    BoschComLocalModuleSensor,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
     BoschComLocalSystemInfoSensor,
@@ -1184,6 +1185,7 @@ async def test_local_system_info_sensor_exposes_dynamic_module_data(
                 "ProductName": "AW 7 OR-S",
                 "ModuleSerialNumber": "module-serial",
                 "ModuleHwIdentStr": "1234",
+                "Ver": "9.17.2-aea82289",
             },
         ],
     }
@@ -1191,8 +1193,17 @@ async def test_local_system_info_sensor_exposes_dynamic_module_data(
 
     sensor = BoschComLocalSystemInfoSensor(coordinator, entry)
 
-    assert sensor.native_value == 2
+    assert sensor.native_value == (
+        "Compress CS5800iAW 12 MB (15.00.01); " "AW 7 OR-S (9.17.2-aea82289)"
+    )
     assert sensor.extra_state_attributes == info
+
+    module_sensor = BoschComLocalModuleSensor(coordinator, entry, info["values"][1], 1)
+    assert module_sensor.native_value == (
+        'ProductName: "AW 7 OR-S"; ModuleSerialNumber: "module-serial"; '
+        'ModuleHwIdentStr: "1234"; Ver: "9.17.2-aea82289"'
+    )
+    assert module_sensor.extra_state_attributes == info["values"][1]
 
 
 @pytest.mark.asyncio

@@ -65,9 +65,11 @@ from .coordinator import (
 )
 from .local_sensor import (
     LOCAL_SENSORS,
+    BoschComLocalModuleSensor,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
     BoschComLocalSystemInfoSensor,
+    local_module_key,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -98,7 +100,10 @@ async def async_setup_entry(
         # ---- Local API sensors (only when local access is configured) ----
         # Read coordinator.local_data, so they survive a cloud outage. Absent
         # local config -> local_first is None -> no entities created at all.
-        if getattr(coordinator, "local_first", None) is not None:
+        if (
+            isinstance(coordinator, BoschComModuleCoordinatorK40)
+            and coordinator.local_first is not None
+        ):
             entities.extend(
                 BoschComLocalSensor(
                     coordinator=coordinator,
@@ -116,6 +121,26 @@ async def async_setup_entry(
                 BoschComLocalSystemInfoSensor(
                     coordinator=coordinator, config_entry=config_entry
                 )
+            )
+            local_system_info = getattr(coordinator, "local_system_info", None)
+            modules = (
+                local_system_info.get("values")
+                if isinstance(local_system_info, dict)
+                else None
+            )
+            if isinstance(modules, list):
+                entities.extend(
+                    BoschComLocalModuleSensor(
+                        coordinator=coordinator,
+                        config_entry=config_entry,
+                        module=module,
+                        index=index,
+                    )
+                    for index, module in enumerate(modules)
+                    if isinstance(module, dict)
+                )
+            _add_local_modules_later(
+                coordinator, config_entry, async_add_entities, modules
             )
 
         # ---- Notifications per device type (existing) ----
@@ -4084,6 +4109,44 @@ def _add_pending_sensors_later(
             async_add_entities(new)
 
     config_entry.async_on_unload(coordinator.async_add_listener(_async_add_present))
+
+
+def _add_local_modules_later(
+    coordinator,
+    config_entry: config_entries.ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+    initial_modules: Any,
+) -> None:
+    """Add module sensors if a later basicInfo response reports new modules."""
+    known = {
+        local_module_key(module, index)
+        for index, module in enumerate(initial_modules or [])
+        if isinstance(module, dict)
+    }
+
+    @callback
+    def _add_new_modules() -> None:
+        info = getattr(coordinator, "local_system_info", None)
+        if not isinstance(info, dict):
+            return
+        modules = info.get("values")
+        if not isinstance(modules, list):
+            return
+        new_entities = []
+        for index, module in enumerate(modules):
+            if not isinstance(module, dict):
+                continue
+            key = local_module_key(module, index)
+            if key in known:
+                continue
+            known.add(key)
+            new_entities.append(
+                BoschComLocalModuleSensor(coordinator, config_entry, module, index)
+            )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_add_new_modules))
 
 
 # ===================================================================

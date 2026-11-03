@@ -625,7 +625,10 @@
         "name": "Datenquelle"
       },
       "local_system_info": {
-        "name": "Gateway-Modulanzahl"
+        "name": "Gateway-Modulinformationen"
+      },
+      "local_module_details": {
+        "name": "Gateway-Modul {module}"
       },
       "bacon_air_quality": {
         "name": "Luftqualität",
