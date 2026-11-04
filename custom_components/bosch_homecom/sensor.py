@@ -64,6 +64,7 @@ from .coordinator import (
     BoschComModuleCoordinatorWddw2,
 )
 from .local_sensor import (
+    LOCAL_EXTRA_SENSORS,
     LOCAL_SENSORS,
     BoschComLocalModuleSensor,
     BoschComLocalSensor,
@@ -111,6 +112,24 @@ async def async_setup_entry(
                     description=description,
                 )
                 for description in LOCAL_SENSORS
+            )
+            local_resources = (
+                getattr(getattr(coordinator, "local_data", None), "resources", {}) or {}
+            )
+            local_extra_present = [
+                description
+                for description in LOCAL_EXTRA_SENSORS
+                if description.resource in local_resources
+            ]
+            entities.extend(
+                BoschComLocalSensor(coordinator, config_entry, description)
+                for description in local_extra_present
+            )
+            _add_local_extra_sensors_later(
+                coordinator,
+                config_entry,
+                async_add_entities,
+                {description.key for description in local_extra_present},
             )
             entities.append(
                 BoschComLocalSourceSensor(
@@ -612,6 +631,17 @@ async def async_setup_entry(
                         "actualSupplyTemperature",
                         "supply_temperature",
                         "supply_temperature",
+                        device_class=SensorDeviceClass.TEMPERATURE,
+                        native_unit="°C",
+                    )
+                )
+            if hs.get("currentSupplySetpoint"):
+                entities.append(
+                    BoschComK40ExtraSensor(
+                        coordinator,
+                        "currentSupplySetpoint",
+                        "heat_source_supply_setpoint",
+                        "heat_source_supply_setpoint",
                         device_class=SensorDeviceClass.TEMPERATURE,
                         native_unit="°C",
                     )
@@ -4147,6 +4177,34 @@ def _add_local_modules_later(
             async_add_entities(new_entities)
 
     config_entry.async_on_unload(coordinator.async_add_listener(_add_new_modules))
+
+
+def _add_local_extra_sensors_later(
+    coordinator,
+    config_entry: config_entries.ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+    initial_keys: set[str],
+) -> None:
+    """Add extra local resource sensors when the gateway starts serving them."""
+    known = set(initial_keys)
+
+    @callback
+    def _add_new_resources() -> None:
+        resources = (
+            getattr(getattr(coordinator, "local_data", None), "resources", {}) or {}
+        )
+        new_entities = []
+        for description in LOCAL_EXTRA_SENSORS:
+            if description.key in known or description.resource not in resources:
+                continue
+            known.add(description.key)
+            new_entities.append(
+                BoschComLocalSensor(coordinator, config_entry, description)
+            )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_add_new_resources))
 
 
 # ===================================================================

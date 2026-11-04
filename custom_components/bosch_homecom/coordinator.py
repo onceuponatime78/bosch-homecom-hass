@@ -631,13 +631,19 @@ class _K40ExtraEndpointsMixin:
 # Cloud resource paths are the local ones prefixed with ``/resource``.
 _LOCAL_OUTDOOR_TEMP = "/system/sensors/temperatures/outdoor_t1"
 _LOCAL_HEAT_SOURCES: dict[str, str] = {
+    "pumpType": "/heatSources/hs1/heatPumpType",
     "actualSupplyTemperature": "/heatSources/actualSupplyTemperature",
     "returnTemperature": "/heatSources/returnTemperature",
+    "currentSupplySetpoint": "/heatSources/currentSupplySetpoint",
     "actualModulation": "/heatSources/actualModulation",
     "actualHeatDemand": "/heatSources/actualHeatDemand",
     "systemPressure": "/heatSources/systemPressure",
     "starts": "/heatSources/hs1/numberOfStarts",
     "totalWorkingTime": "/heatSources/workingTime/totalSystem",
+    "eHeaterStatus": "/heatSources/Source/eHeater/status",
+    "consumption": "/heatSources/emon/totalConsumption",
+    "chConsumption": "/heatSources/emon/chConsumption",
+    "dhwConsumption": "/heatSources/emon/dhwConsumption",
 }
 # Per-circuit keys, read from ``{circuit id}/{key}``, e.g. /dhwCircuits/dhw1/actualTemp.
 _LOCAL_DHW_KEYS = ("actualTemp", "currentTemperatureLevel", "chargeRemainingTime")
@@ -649,6 +655,12 @@ _LOCAL_HC_STATUS_TO_MODE: dict[str, str] = {
     "heating_auto": "auto",
     "heating_manual_on": "manual",
     "heating_manual_off": "off",
+}
+_LOCAL_RESOURCE_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "starts": ("/heatSources/numberOfStarts",),
+}
+_LOCAL_DHW_RESOURCE_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "actualTemp": ("/heatSources/dhw/cylinderTemperature",),
 }
 _LOCAL_DHW_CIRCUIT = "/dhwCircuits/dhw1"
 _LOCAL_HC_CIRCUIT = "/heatingCircuits/hc1"
@@ -664,8 +676,17 @@ def _overlay_local(data: BHCDeviceK40, local: BHCDeviceK40Local | None) -> BHCDe
     if not resources:
         return data
 
-    def merged(node, path: str):
+    def merged(node, path: str, fallback_paths: tuple[str, ...] = ()):
         payload = resources.get(path)
+        if not isinstance(payload, dict):
+            payload = next(
+                (
+                    resources.get(fallback)
+                    for fallback in fallback_paths
+                    if isinstance(resources.get(fallback), dict)
+                ),
+                None,
+            )
         if not isinstance(payload, dict):
             return node
         return {**node, **payload} if isinstance(node, dict) else dict(payload)
@@ -685,7 +706,11 @@ def _overlay_local(data: BHCDeviceK40, local: BHCDeviceK40Local | None) -> BHCDe
             if isinstance(ref, dict) and isinstance(ref.get("id"), str):
                 ref = dict(ref)
                 for key in keys:
-                    ref[key] = merged(ref.get(key), f"{ref['id']}/{key}")
+                    ref[key] = merged(
+                        ref.get(key),
+                        f"{ref['id']}/{key}",
+                        _LOCAL_DHW_RESOURCE_FALLBACKS.get(key, ()),
+                    )
                 if mode := modes.get(ref["id"]):
                     node = ref.get("operationMode")
                     ref["operationMode"] = {
@@ -697,15 +722,47 @@ def _overlay_local(data: BHCDeviceK40, local: BHCDeviceK40Local | None) -> BHCDe
 
     heat_sources = dict(data.heat_sources or {})
     for key, path in _LOCAL_HEAT_SOURCES.items():
-        heat_sources[key] = merged(heat_sources.get(key) or {}, path)
+        heat_sources[key] = merged(
+            heat_sources.get(key) or {},
+            path,
+            _LOCAL_RESOURCE_FALLBACKS.get(key, ()),
+        )
+
+    flame_indication = merged(data.flame_indication, "/heatSources/flameStatus")
+    local_notifications = _local_notification_items(resources.get("/notifications"))
+
+    if "/heatSources/hs1/numberOfStarts" not in resources and isinstance(
+        resources.get("/heatSources/numberOfStarts"), dict
+    ):
+        heat_sources["starts"] = merged(
+            heat_sources.get("starts") or {}, "/heatSources/numberOfStarts"
+        )
 
     return dataclasses.replace(
         data,
+        notifications=(
+            data.notifications
+            if data.notifications is not None
+            else local_notifications
+        ),
         outdoor_temp=merged(data.outdoor_temp, _LOCAL_OUTDOOR_TEMP),
         heat_sources=heat_sources,
+        flame_indication=flame_indication,
         dhw_circuits=circuits(data.dhw_circuits, _LOCAL_DHW_KEYS),
         heating_circuits=circuits(data.heating_circuits, _LOCAL_HC_KEYS),
     )
+
+
+def _local_notification_items(payload: Any) -> list[dict] | None:
+    """Extract a notification list from the optional Local API resource."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("values", "notifications", "items", "value"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                return values
+    return None
 
 
 def _cloud_skeleton(

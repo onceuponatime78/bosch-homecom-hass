@@ -54,6 +54,7 @@ class LocalSensorDescription(SensorEntityDescription):
 
     resource: str
     field: str | None = None
+    fallback_resources: tuple[str, ...] = ()
 
 
 _TEMP = SensorDeviceClass.TEMPERATURE
@@ -67,6 +68,7 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         key="local_compressor_power",
         translation_key="local_compressor_power",
         resource="/heatSources/compressor/powerElecActual",
+        fallback_resources=("/heatSources/hs1/refrigerant/compressorElecPowerActual",),
         device_class=SensorDeviceClass.POWER,
         native_unit_of_measurement=UnitOfPower.WATT,
         state_class=_MEASUREMENT,
@@ -162,6 +164,7 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         translation_key="local_starts_ch",
         resource="/heatSources/hs1/numberOfStarts",
         field="ch",
+        fallback_resources=("/heatSources/numberOfStarts",),
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=_DIAGNOSTIC,
     ),
@@ -170,6 +173,7 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         translation_key="local_starts_dhw",
         resource="/heatSources/hs1/numberOfStarts",
         field="dhw",
+        fallback_resources=("/heatSources/numberOfStarts",),
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=_DIAGNOSTIC,
     ),
@@ -191,6 +195,72 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
         native_unit_of_measurement=UnitOfTime.SECONDS,
         state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=_DIAGNOSTIC,
+    ),
+)
+
+# Additional Local API values that have no equivalent Home Assistant entity.
+# Overlapping values are merged into the existing cloud-backed entities in the
+# coordinator instead, so the device does not acquire duplicate sensors.
+LOCAL_EXTRA_SENSORS: tuple[LocalSensorDescription, ...] = (
+    LocalSensorDescription(
+        key="local_system_type",
+        translation_key="local_system_type",
+        resource="/system/type",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_system_bus",
+        translation_key="local_system_bus",
+        resource="/system/bus",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_power_limitation",
+        translation_key="local_power_limitation",
+        resource="/system/powerLimitation/active",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_silent_mode_status",
+        translation_key="local_silent_mode_status",
+        resource="/system/powerConstraints/silentMode/status",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_em_status",
+        translation_key="local_em_status",
+        resource="/heatSources/emStatus",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_additional_heater_flow_temp",
+        translation_key="local_additional_heater_flow_temp",
+        resource="/heatSources/additionalHeater/flowTemp",
+        device_class=_TEMP,
+        native_unit_of_measurement=_CELSIUS,
+        state_class=_MEASUREMENT,
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_refrigerant_status",
+        translation_key="local_refrigerant_status",
+        resource="/heatSources/hs1/refrigerant/status",
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_dhw_current_setpoint",
+        translation_key="local_dhw_current_setpoint",
+        resource="/dhwCircuits/dhw1/currentSetpoint",
+        device_class=_TEMP,
+        native_unit_of_measurement=_CELSIUS,
+        state_class=_MEASUREMENT,
+        entity_category=_DIAGNOSTIC,
+    ),
+    LocalSensorDescription(
+        key="local_dhw_thermal_disinfection",
+        translation_key="local_dhw_thermal_disinfection",
+        resource="/dhwCircuits/dhw1/tdrunningStatus",
         entity_category=_DIAGNOSTIC,
     ),
 )
@@ -242,17 +312,23 @@ class BoschComLocalSensor(CoordinatorEntity, SensorEntity):
         """Read this sensor's value out of the local payload."""
         local = getattr(self.coordinator, "local_data", None)
         resources = getattr(local, "resources", None) or {}
-        payload = resources.get(self.entity_description.resource)
-        if not isinstance(payload, dict):
-            self._attr_native_value = None
-            return
-
-        if self.entity_description.field is not None:
-            self._attr_native_value = _emon_field(
-                payload.get("values"), self.entity_description.field
-            )
-            return
-        self._attr_native_value = payload.get("value")
+        for path in (
+            self.entity_description.resource,
+            *self.entity_description.fallback_resources,
+        ):
+            payload = resources.get(path)
+            if not isinstance(payload, dict):
+                continue
+            if self.entity_description.field is not None:
+                value = _emon_field(
+                    payload.get("values"), self.entity_description.field
+                )
+            else:
+                value = payload.get("value")
+            if value is not None:
+                self._attr_native_value = value
+                return
+        self._attr_native_value = None
 
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""

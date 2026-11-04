@@ -56,6 +56,7 @@ from custom_components.bosch_homecom.diagnostics import (
     async_get_config_entry_diagnostics,
 )
 from custom_components.bosch_homecom.local_sensor import (
+    LOCAL_EXTRA_SENSORS,
     LOCAL_SENSORS,
     BoschComLocalModuleSensor,
     BoschComLocalSensor,
@@ -63,6 +64,7 @@ from custom_components.bosch_homecom.local_sensor import (
     BoschComLocalSystemInfoSensor,
     _emon_field,
 )
+from custom_components.bosch_homecom.sensor import _add_local_extra_sensors_later
 
 _FLOW_CLIENT = "custom_components.bosch_homecom.config_flow.HomeComK40Local"
 HOST = "192.0.2.10"
@@ -1056,6 +1058,27 @@ async def test_local_sensor_reads_scalar_and_emon_values(hass, entry, device, fi
     assert power.available is True
 
 
+@pytest.mark.asyncio
+async def test_local_sensor_falls_back_to_alternate_compressor_power_path(
+    hass, entry, device, firmware
+):
+    """A second Local API path feeds the existing compressor power sensor."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_data = _local_device(
+        resources={
+            "/heatSources/compressor/powerElecActual": {"value": None},
+            "/heatSources/hs1/refrigerant/compressorElecPowerActual": {"value": 712.0},
+        }
+    )
+    coordinator.local_healthy = True
+
+    description = {d.key: d for d in LOCAL_SENSORS}["local_compressor_power"]
+    sensor = BoschComLocalSensor(coordinator, entry, description)
+
+    assert sensor.native_value == 712.0
+
+
 def test_pump_volume_flow_is_litres_per_hour() -> None:
     """The gateway reports the pump volume flow in l/h, not L/min (issue #211)."""
     flow = {d.key: d for d in LOCAL_SENSORS}["local_pump_volume_flow"]
@@ -1321,6 +1344,92 @@ def test_overlay_replaces_shared_values_and_keeps_cloud_only_ones() -> None:
     }
     assert dhw["operationMode"] == {"value": "ownprogram"}
     assert data.heating_circuits[0]["currentSuWiMode"]["value"] == "forced"
+
+
+def test_overlay_reuses_local_values_for_existing_cloud_entities() -> None:
+    """Overlapping local resources feed existing entities instead of duplicates."""
+    local_notifications = [{"dcd": "A01", "ccd": "5"}]
+    local_flame = {"value": "off", "unitOfMeasure": "string"}
+    local_heater = {"value": "heating", "allowedValues": ["off", "heating"]}
+    local_consumption = {
+        "type": "emonValue",
+        "unit": "kWh",
+        "values": [{"compressor": 15}, {"eheater": 2}, {"outputProduced": 30}],
+    }
+    local = _local_device(
+        resources={
+            "/notifications": {"values": local_notifications},
+            "/heatSources/flameStatus": local_flame,
+            "/heatSources/Source/eHeater/status": local_heater,
+            "/heatSources/hs1/heatPumpType": {"value": "local_pump_type"},
+            "/heatSources/currentSupplySetpoint": {"value": 32.5},
+            "/heatSources/emon/totalConsumption": local_consumption,
+            "/heatSources/emon/chConsumption": {"value": "local_ch_energy"},
+            "/heatSources/emon/dhwConsumption": {"value": "local_dhw_energy"},
+            "/heatSources/hs1/numberOfStarts": None,
+            "/heatSources/numberOfStarts": {
+                "values": [{"total": 200}, {"ch": 120}, {"dhw": 80}]
+            },
+            "/heatSources/dhw/cylinderTemperature": {"value": 52.0},
+        }
+    )
+
+    data = _overlay_local(_cloud_with_circuits(), local)
+
+    assert data.notifications == local_notifications
+    assert data.flame_indication == local_flame
+    assert data.heat_sources["eHeaterStatus"] == local_heater
+    assert data.heat_sources["pumpType"]["value"] == "local_pump_type"
+    assert data.heat_sources["currentSupplySetpoint"]["value"] == 32.5
+    assert data.heat_sources["consumption"] == local_consumption
+    assert data.heat_sources["chConsumption"]["value"] == "local_ch_energy"
+    assert data.heat_sources["dhwConsumption"]["value"] == "local_dhw_energy"
+    assert data.heat_sources["starts"]["values"][0]["total"] == 200
+    assert data.dhw_circuits[0]["actualTemp"]["value"] == 52.0
+
+
+@pytest.mark.asyncio
+async def test_extra_local_sensor_reads_only_resources_the_gateway_serves(
+    hass, entry, device, firmware
+):
+    """Additional paths are described only when the local poll returns them."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    resource = "/heatSources/emStatus"
+    coordinator.local_data = _local_device(resources={resource: {"value": "on"}})
+    coordinator.local_healthy = True
+
+    description = next(d for d in LOCAL_EXTRA_SENSORS if d.resource == resource)
+    sensor = BoschComLocalSensor(coordinator, entry, description)
+
+    assert sensor.native_value == "on"
+    assert sensor.available
+
+
+@pytest.mark.asyncio
+async def test_extra_local_sensor_is_added_when_gateway_starts_serving_resource(
+    hass, entry, device, firmware
+):
+    """A resource first absent at setup becomes a sensor when later reported."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    system_type = next(d for d in LOCAL_EXTRA_SENSORS if d.key == "local_system_type")
+    system_bus = next(d for d in LOCAL_EXTRA_SENSORS if d.key == "local_system_bus")
+    coordinator.local_data = _local_device(
+        resources={system_type.resource: {"value": "heatPump"}}
+    )
+    added = []
+
+    _add_local_extra_sensors_later(coordinator, entry, added.extend, {system_type.key})
+    coordinator.local_data = _local_device(
+        resources={
+            system_type.resource: {"value": "heatPump"},
+            system_bus.resource: {"value": "EMS2.0"},
+        }
+    )
+    coordinator.async_update_listeners()
+
+    assert [sensor.entity_description.key for sensor in added] == [system_bus.key]
 
 
 def test_overlay_does_not_mutate_the_cloud_payload() -> None:
