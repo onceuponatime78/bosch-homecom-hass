@@ -784,6 +784,15 @@
           "ems2_0": "EMS 2.0",
           "detecting": "Erkennung läuft"
         }
+      },
+      "local_silent_mode_status": {
+        "name": "Lokaler Leisemodus-Status"
+      },
+      "local_system_info": {
+        "name": "Lokale Systeminformationen"
+      },
+      "local_module_details": {
+        "name": "{module} Details"
       }
     },
     "binary_sensor": {

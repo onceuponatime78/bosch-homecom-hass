@@ -66,9 +66,12 @@ from .coordinator import (
 from .local_sensor import (
     LOCAL_OPTIONAL_SENSORS,
     LOCAL_SENSORS,
+    BoschComLocalModuleSensor,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
+    BoschComLocalSystemInfoSensor,
     _state_values,
+    local_module_key,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -117,6 +120,12 @@ async def async_setup_entry(
                     coordinator=coordinator, config_entry=config_entry
                 )
             )
+            entities.append(BoschComLocalSystemInfoSensor(coordinator))
+            entities.extend(
+                BoschComLocalModuleSensor(coordinator, module, index)
+                for index, module in enumerate(coordinator.local_modules or ())
+            )
+            _add_local_modules_later(coordinator, config_entry, async_add_entities)
             local_pending: list[_PendingSensor] = []
             for candidate in _local_optional_candidates(coordinator, config_entry):
                 _add_or_defer(candidate, entities, local_pending)
@@ -4148,6 +4157,27 @@ def _add_pending_sensors_later(
             async_add_entities(new)
 
     config_entry.async_on_unload(coordinator.async_add_listener(_async_add_present))
+
+
+def _add_local_modules_later(coordinator, config_entry, async_add_entities) -> None:
+    """Discover modules that first appear after the platform was set up."""
+    known = {
+        local_module_key(module, index)
+        for index, module in enumerate(coordinator.local_modules or ())
+    }
+
+    @callback
+    def _add_new_modules() -> None:
+        entities = []
+        for index, module in enumerate(coordinator.local_modules or ()):
+            key = local_module_key(module, index)
+            if key not in known:
+                known.add(key)
+                entities.append(BoschComLocalModuleSensor(coordinator, module, index))
+        if entities:
+            async_add_entities(entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_add_new_modules))
 
 
 def _local_optional_candidates(coordinator, config_entry) -> list[_PendingSensor]:

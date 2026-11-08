@@ -67,11 +67,15 @@ from custom_components.bosch_homecom.diagnostics import (
 from custom_components.bosch_homecom.local_sensor import (
     LOCAL_OPTIONAL_SENSORS,
     LOCAL_SENSORS,
+    BoschComLocalModuleSensor,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
+    BoschComLocalSystemInfoSensor,
     _emon_field,
+    local_module_key,
 )
 from custom_components.bosch_homecom.sensor import (
+    _add_local_modules_later,
     _add_or_defer,
     _add_pending_sensors_later,
     _emon_part,
@@ -1555,6 +1559,125 @@ async def test_diagnostics_list_the_modules_without_serials(
     assert modules[0]["product_serial"] == "**REDACTED**"
     assert "83703740000878738215205" not in str(dump)
     assert "25302791000098738806125" not in str(dump)
+
+
+@pytest.mark.asyncio
+async def test_module_sensors_show_cached_inventory_and_follow_updates(
+    hass, entry, device, firmware
+):
+    """Inventory entities register and update without polling the gateway again."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_modules = _SPEC_MODULES
+    coordinator.local_healthy = True
+    summary = BoschComLocalSystemInfoSensor(coordinator)
+    module = BoschComLocalModuleSensor(coordinator, _SPEC_MODULES[0], 0)
+    assert module.unique_id == f"{GATEWAY}-local-module-8-8"
+    platform = MockEntityPlatform(hass, domain="sensor", platform_name=DOMAIN)
+    await platform.async_add_entities([summary, module])
+
+    assert "Compress CS6800iAW 12 E" in hass.states.get(summary.entity_id).state
+    state = hass.states.get(module.entity_id)
+    assert state.attributes["ProductName"] == "Compress CS6800iAW 12 E"
+    assert state.attributes["Ver"] == "23.06.02-5.33-d510f849"
+    assert state.attributes["Id"] == "8"
+
+    # Reordering must not change which physical module the entity represents.
+    updated = replace(_SPEC_MODULES[0], version="new-version")
+    coordinator.local_modules = (_SPEC_MODULES[1], updated, _SPEC_MODULES[2])
+    coordinator.async_update_listeners()
+    await hass.async_block_till_done()
+    assert hass.states.get(module.entity_id).attributes["Ver"] == "new-version"
+    coordinator.local_client.async_get_modules.assert_not_awaited()
+
+    coordinator.local_modules = (_SPEC_MODULES[1],)
+    coordinator.async_update_listeners()
+    await hass.async_block_till_done()
+    assert hass.states.get(module.entity_id).state == "unavailable"
+
+    coordinator.local_healthy = False
+    coordinator.async_update_listeners()
+    await hass.async_block_till_done()
+    assert hass.states.get(summary.entity_id).state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_module_sensors_discover_late_modules_once(hass, entry, device, firmware):
+    """An inventory missing at setup or expanded later adds each module once."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    added = []
+    _add_local_modules_later(coordinator, entry, added.extend)
+    coordinator.local_modules = _SPEC_MODULES[:1]
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    assert len(added) == 1
+
+    coordinator.local_modules = tuple(reversed(_SPEC_MODULES))
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    assert len(added) == 3
+    assert len({entity.unique_id for entity in added}) == 3
+
+
+def test_module_identity_distinguishes_tokens_and_keeps_serial_fallback():
+    """Repeated bus IDs use Tok; a module without either can use its serial."""
+    first = _module(bus_id="8", token="1")
+    second = _module(bus_id="8", token="2")
+    assert local_module_key(first, 0) != local_module_key(second, 1)
+    assert local_module_key(first, 0) == local_module_key(first, 5)
+    assert local_module_key(_module(module_serial="serial"), 0) == "serial"
+    assert local_module_key(_module(), 2) == "index-2"
+
+
+@pytest.mark.asyncio
+async def test_inventory_display_limits_do_not_truncate_attributes(
+    hass, entry, device, firmware
+):
+    """The 255-character state limit must not discard module details."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    long_module = replace(_SPEC_MODULES[0], product_name="Appliance " * 60)
+    coordinator.local_modules = (long_module,)
+    summary = BoschComLocalSystemInfoSensor(coordinator)
+    module = BoschComLocalModuleSensor(coordinator, long_module, 0)
+    assert len(summary.native_value) == 255
+    assert len(module.native_value) == 255
+    assert (
+        summary.extra_state_attributes["values"][0]["ProductName"]
+        == long_module.product_name
+    )
+    assert module.extra_state_attributes["ProductName"] == long_module.product_name
+
+
+@pytest.mark.asyncio
+async def test_local_silent_status_is_discovered_and_tracks_gateway(
+    hass, entry, device, firmware
+):
+    """The read-only silent status appears only when served, then updates."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    entities, pending = [], []
+    for candidate in _local_optional_candidates(coordinator, entry):
+        _add_or_defer(candidate, entities, pending)
+    assert entities == []
+    added = []
+    _add_pending_sensors_later(coordinator, entry, pending, added.extend)
+    resource = "/system/powerConstraints/silentMode/status"
+    coordinator.local_data = _local_device(resources={resource: {"value": "active"}})
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    assert len(added) == 1
+    sensor = added[0]
+    assert sensor.entity_description.key == "local_silent_mode_status"
+    assert sensor.native_value == "active"
+
+    coordinator.local_data = _local_device(resources={resource: {"value": "inactive"}})
+    sensor.set_attr()
+    assert sensor.native_value == "inactive"
+    coordinator.local_healthy = False
+    assert not sensor.available
 
 
 def test_every_local_sensor_has_a_unique_key() -> None:

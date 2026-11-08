@@ -783,6 +783,15 @@
           "ems2_0": "EMS 2.0",
           "detecting": "Detecting"
         }
+      },
+      "local_silent_mode_status": {
+        "name": "Local silent mode status"
+      },
+      "local_system_info": {
+        "name": "Local system information"
+      },
+      "local_module_details": {
+        "name": "{module} details"
       }
     },
     "binary_sensor": {
