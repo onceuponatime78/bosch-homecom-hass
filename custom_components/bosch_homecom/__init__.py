@@ -53,6 +53,7 @@ from homecom_alt import (
 from homecom_alt.const import BACON_DEFAULT_REGION
 import voluptuous as vol
 
+from .auth_diagnostics import AuthDiagnosticSession
 from .const import (
     BACON_AP_TYPE,
     BACON_DEVICE_TYPES,
@@ -160,7 +161,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         _LOGGER.error("No valid credentials provided")
         return False
-    websession = async_get_clientsession(hass)
+    websession = AuthDiagnosticSession(async_get_clientsession(hass), entry.entry_id)
 
     bhc = await HomeComAlt.create(websession, options, True)
 

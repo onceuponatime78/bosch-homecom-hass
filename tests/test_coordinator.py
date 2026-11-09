@@ -594,6 +594,30 @@ async def test_tokens_rotated_during_poll_are_persisted(
     assert entry.data[CONF_REFRESH] == "rotated_refresh"
 
 
+async def test_refresh_failure_and_recovery_visible_without_debug(
+    hass, entry, bhc, device, firmware, caplog
+):
+    """Local fallback must not hide auth failures or expose exception secrets."""
+    entry.add_to_hass(hass)
+    coordinator = BoschComModuleCoordinatorRac(hass, bhc, device, firmware, entry, True)
+    bhc.token = "access-secret"
+    bhc.refresh_token = entry.data[CONF_REFRESH]
+    bhc.get_token = AsyncMock(side_effect=AuthFailedError("exception-secret"))
+    with patch.object(entry, "async_start_reauth"):
+        for _ in range(2):
+            with pytest.raises(UpdateFailed):
+                await coordinator._async_update_data()
+    assert caplog.text.count("OAuth refresh failed") == 1
+    assert "runtime_refresh_matches_entry=True" in caplog.text
+    assert "access-secret" not in caplog.text
+    assert "exception-secret" not in caplog.text
+
+    bhc.get_token = AsyncMock()
+    bhc.async_update = AsyncMock(return_value=_make_rac_data(device, firmware))
+    await coordinator._async_update_data()
+    assert "OAuth refresh recovered" in caplog.text
+
+
 async def test_non_owner_poll_does_not_overwrite_persisted_tokens(
     hass, entry, bhc, device, firmware
 ):

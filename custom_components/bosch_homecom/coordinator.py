@@ -134,6 +134,8 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         # Consecutive failed refreshes served from the last good data, see
         # _hold_last_data.
         self._held_failures = 0
+        self._auth_failure_logged = False
+        self._cloud_auth_failure_logged = False
 
         self.device_info = DeviceInfo(
             serial_number=self.unique_id,
@@ -150,6 +152,16 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         try:
             data = await self.bhc.async_update(self.unique_id)
             built = self._build_device_data(data)
+        except AuthFailedError:
+            if not self._cloud_auth_failure_logged:
+                _LOGGER.warning(
+                    "Device_Id: %s, authentication failed during appliance update "
+                    "after the pre-poll token check; consult OAuth response diagnostics "
+                    "to distinguish a late token exchange from a cloud API rejection",
+                    self.unique_id,
+                )
+                self._cloud_auth_failure_logged = True
+            raise
         except (
             ApiError,
             InvalidSensorDataError,
@@ -164,6 +176,7 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
             self._async_persist_tokens()
 
         self._held_failures = 0
+        self._cloud_auth_failure_logged = False
         return built
 
     def _hold_last_data(self, error: Exception) -> T:
@@ -199,14 +212,35 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         try:
             await self.bhc.get_token()
         except AuthFailedError:
+            self._log_refresh_failure("authentication rejected")
             self.entry.async_start_reauth(self.hass)
             raise UpdateFailed("Re-authentication required") from None
         except (ApiError, NotRespondingError, RetryError, TimeoutError) as error:
+            self._log_refresh_failure(type(error).__name__)
             # The token endpoint was unreachable or answered with a server error
             # (e.g. a DNS timeout or a 5xx), so the refresh token was not spent. A normal failed refresh, retried on
             # the next poll -- not an "unexpected error" with a traceback.
             raise UpdateFailed(f"Token refresh failed: {error}") from error
         self._async_persist_tokens()
+        if self._auth_failure_logged:
+            _LOGGER.warning("Device_Id: %s, OAuth refresh recovered", self.unique_id)
+            self._auth_failure_logged = False
+
+    @callback
+    def _log_refresh_failure(self, category: str) -> None:
+        """Keep local fallback from hiding a refresh failure at normal log levels."""
+        if self._auth_failure_logged:
+            return
+        self._auth_failure_logged = True
+        _LOGGER.warning(
+            "Device_Id: %s, OAuth refresh failed (%s); "
+            "runtime_refresh_matches_entry=%s, access_token_expiry=%s. "
+            "A successful local update does not mean cloud authentication recovered",
+            self.unique_id,
+            category,
+            self.bhc.refresh_token == self.entry.data.get(CONF_REFRESH),
+            decode_jwt_exp(self.bhc.token) if isinstance(self.bhc.token, str) else None,
+        )
 
     @callback
     def _async_persist_tokens(self) -> None:
@@ -874,6 +908,13 @@ class BoschComModuleCoordinatorK40(
         extra local read per poll while the 401s last.
         """
         self._cloud_auth_failures += 1
+        if self._cloud_auth_failures == 1:
+            _LOGGER.warning(
+                "Device_Id: %s, authentication failed during local/cloud polling; "
+                "serving the local gateway. Consult OAuth response diagnostics "
+                "to distinguish a late token exchange from a cloud API rejection",
+                self.unique_id,
+            )
         if self._cloud_auth_refreshed and not self._cloud_auth_outage_warned:
             self._cloud_auth_outage_warned = True
             _LOGGER.warning(
