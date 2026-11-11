@@ -217,9 +217,10 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
             raise UpdateFailed("Re-authentication required") from None
         except (ApiError, NotRespondingError, RetryError, TimeoutError) as error:
             self._log_refresh_failure(type(error).__name__)
-            # The token endpoint was unreachable or answered with a server error
-            # (e.g. a DNS timeout or a 5xx), so the refresh token was not spent. A normal failed refresh, retried on
-            # the next poll -- not an "unexpected error" with a traceback.
+            # A transport/server failure is retried on the next poll. A timeout
+            # does not prove that the refresh token was unspent: SingleKey may
+            # have rotated it before the response was lost. The request-level
+            # diagnostics preserve the failure phase and timing for that case.
             raise UpdateFailed(f"Token refresh failed: {error}") from error
         self._async_persist_tokens()
         if self._auth_failure_logged:
