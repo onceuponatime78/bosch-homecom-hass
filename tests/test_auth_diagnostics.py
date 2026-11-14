@@ -343,3 +343,46 @@ async def test_oauth_async_context_manager_preserves_cleanup_and_expiry_metadata
     assert "access_expires_in_s_at_start=None" not in caplog.text
     assert "overlap_observed=False" in caplog.text
     assert token not in caplog.text
+
+
+async def test_overlap_between_setups_of_one_entry_is_reported(caplog):
+    """A reload's new session sees the old instance's exchange still running."""
+    raw = Mock()
+    old = AuthDiagnosticSession(raw, "reload-entry")
+    new = AuthDiagnosticSession(raw, "reload-entry")
+    other_entry = AuthDiagnosticSession(raw, "other-entry")
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def request(method, url, **kwargs):
+        started.set()
+        await finish.wait()
+        response = _response(
+            200, {"access_token": "access-secret", "refresh_token": "new-secret"}
+        )
+        await kwargs["raise_for_status"](response)
+        return response
+
+    raw.request = Mock(side_effect=request)
+
+    async def run(session):
+        return await session.request(
+            "post", TOKEN_URL, raise_for_status=True, data={"refresh_token": "secret"}
+        )
+
+    first = asyncio.create_task(run(old))
+    await started.wait()
+    unrelated = asyncio.create_task(run(other_entry))
+    await asyncio.sleep(0)
+    assert "Overlapping OAuth exchanges" not in caplog.text
+    second = asyncio.create_task(run(new))
+    await asyncio.sleep(0)
+    finish.set()
+    await asyncio.gather(first, second, unrelated)
+
+    assert "other_session=True" in caplog.text
+    assert f"session={new.session_id}" in caplog.text
+    assert old.session_id in caplog.text
+    assert "same_refresh_token=True" in caplog.text
+    assert "secret" not in caplog.text
+    assert not old._active and not new._active

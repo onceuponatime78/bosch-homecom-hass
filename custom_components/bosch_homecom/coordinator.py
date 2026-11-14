@@ -52,6 +52,7 @@ from homecom_alt import (
 )
 from tenacity import RetryError
 
+from .auth_diagnostics import short_fingerprint
 from .bacon import humanize_appliance_type
 from .const import (
     BACON_MODE_FIELDS,
@@ -142,6 +143,13 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         self._held_failures = 0
         self._auth_failure_logged = False
         self._cloud_auth_failure_logged = False
+        # The token pair this instance last read from or wrote to the entry.
+        # The entry is the source of truth: a reauth, or another setup of this
+        # entry during a reload, may store newer tokens there at any time.
+        self._synced_tokens: tuple[str | None, str | None] = (
+            getattr(bhc, "token", None),
+            getattr(bhc, "refresh_token", None),
+        )
 
         self.device_info = DeviceInfo(
             serial_number=self.unique_id,
@@ -215,6 +223,7 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         """
         if not self.auth_provider:
             return
+        self._async_adopt_stored_tokens()
         try:
             await self.bhc.get_token()
         except AuthFailedError:
@@ -233,6 +242,39 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
             _LOGGER.warning("Device_Id: %s, OAuth refresh recovered", self.unique_id)
             self._auth_failure_logged = False
 
+    def _stored_tokens(self) -> tuple[str | None, str | None]:
+        """The token pair currently stored on the config entry."""
+        return self.entry.data.get(CONF_TOKEN), self.entry.data.get(CONF_REFRESH)
+
+    def _token_log_context(self) -> str:
+        """Session and refresh-token labels that match the OAuth diagnostics."""
+        session = getattr(getattr(self.bhc, "_session", None), "session_id", None)
+        return (
+            f"session={session} memory={short_fingerprint(self.bhc.refresh_token)} "
+            f"synced={short_fingerprint(self._synced_tokens[1])} "
+            f"stored={short_fingerprint(self.entry.data.get(CONF_REFRESH))}"
+        )
+
+    @callback
+    def _async_adopt_stored_tokens(self) -> None:
+        """Take over tokens another writer stored since this instance last synced.
+
+        Refreshing with the pair in memory after a reauth or a reload stored a
+        newer one would spend a token the entry no longer holds, or one another
+        instance already spent, and SingleKey would reject it.
+        """
+        stored = self._stored_tokens()
+        if stored == self._synced_tokens or not stored[1]:
+            return
+        _LOGGER.info(
+            "Device_Id: %s, adopting tokens stored on the entry by another "
+            "writer (reauth or another setup); %s",
+            self.unique_id,
+            self._token_log_context(),
+        )
+        self.bhc.token, self.bhc.refresh_token = stored
+        self._synced_tokens = stored
+
     @callback
     def _log_refresh_failure(self, category: str) -> None:
         """Keep local fallback from hiding a refresh failure at normal log levels."""
@@ -241,29 +283,47 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         self._auth_failure_logged = True
         _LOGGER.warning(
             "Device_Id: %s, OAuth refresh failed (%s); "
-            "runtime_refresh_matches_entry=%s, access_token_expiry=%s. "
+            "runtime_refresh_matches_entry=%s, access_token_expiry=%s, %s. "
             "A successful local update does not mean cloud authentication recovered",
             self.unique_id,
             category,
             self.bhc.refresh_token == self.entry.data.get(CONF_REFRESH),
             decode_jwt_exp(self.bhc.token) if isinstance(self.bhc.token, str) else None,
+            self._token_log_context(),
         )
 
     @callback
     def _async_persist_tokens(self) -> None:
-        """Save the token owner's latest credentials without rewriting peers'."""
+        """Save a rotation this instance made, never older tokens over newer ones.
+
+        Only tokens that changed in memory since the last sync are written, and
+        only while the entry still holds that synced pair. If the entry changed
+        too, someone else stored a newer pair (a reauth, which reloads the entry
+        next, or another setup); that pair wins and is adopted.
+        """
         if not self.auth_provider:
             return
-        if self.bhc.token != self.entry.data.get(
-            CONF_TOKEN
-        ) or self.bhc.refresh_token != self.entry.data.get(CONF_REFRESH):
-            new_data = dict(self.entry.data)
-            new_data[CONF_TOKEN] = self.bhc.token
-            new_data[CONF_REFRESH] = self.bhc.refresh_token
-            self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-            _LOGGER.debug(
-                "Device_Id: %s, persisted refreshed auth tokens", self.unique_id
+        current = (self.bhc.token, self.bhc.refresh_token)
+        if current == self._synced_tokens:
+            return
+        if self._stored_tokens() != self._synced_tokens:
+            _LOGGER.warning(
+                "Device_Id: %s, not saving the tokens this instance rotated: the "
+                "entry received others meanwhile; %s",
+                self.unique_id,
+                self._token_log_context(),
             )
+            self._async_adopt_stored_tokens()
+            return
+        new_data = dict(self.entry.data)
+        new_data[CONF_TOKEN], new_data[CONF_REFRESH] = current
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        self._synced_tokens = current
+        _LOGGER.info(
+            "Device_Id: %s, saved rotated tokens; %s",
+            self.unique_id,
+            self._token_log_context(),
+        )
 
     @abstractmethod
     def _build_device_data(self, data: T) -> T:
@@ -995,6 +1055,7 @@ class BoschComModuleCoordinatorK40(
             )
         if provider is None:
             return False
+        provider._async_adopt_stored_tokens()
         try:
             await provider.bhc.get_token(force=True)
         except AuthFailedError:

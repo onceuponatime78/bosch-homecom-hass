@@ -39,6 +39,10 @@ _ERROR_CODES = {
     "temporarily_unavailable",
 }
 _REPEAT_INTERVAL = 900
+# OAuth exchanges in flight, per config entry and across its setups: a reload
+# builds a new session while the old instance may still be refreshing, and that
+# overlap spends one refresh token twice. Keyed by (session id, request number).
+_ACTIVE_BY_ENTRY: dict[str, dict[tuple[str, int], _Attempt]] = {}
 
 
 def _fingerprint(value: Any) -> str | None:
@@ -46,6 +50,12 @@ def _fingerprint(value: Any) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def short_fingerprint(value: Any) -> str | None:
+    """A refresh token's log label: eight hex digits of its SHA-256, not the token."""
+    fingerprint = _fingerprint(value)
+    return fingerprint[:8] if fingerprint else None
 
 
 @dataclass
@@ -98,8 +108,13 @@ class AuthDiagnosticSession:
         self._last_warning = 0.0
         self._session_id = uuid4().hex[:8]
         self._sequence = 0
-        self._active: dict[int, _Attempt] = {}
+        self._active = _ACTIVE_BY_ENTRY.setdefault(entry_id, {})
         self._uncertain: tuple[str | None, int, float] | None = None
+
+    @property
+    def session_id(self) -> str:
+        """Identify this setup's session in OAuth and token-sync log lines."""
+        return self._session_id
 
     def __getattr__(self, name: str) -> Any:
         """Leave all other client-session features untouched."""
@@ -171,14 +186,16 @@ class AuthDiagnosticSession:
                 other.overlap = True
             _LOGGER.warning(
                 "Overlapping OAuth exchanges: entry=%s session=%s request=%s "
-                "active_requests=%s same_refresh_token=%s",
+                "active_requests=%s same_refresh_token=%s other_session=%s",
                 self._entry_id,
                 self._session_id,
                 attempt.number,
-                tuple(self._active),
+                tuple(f"{session}/{number}" for session, number in self._active),
                 same_refresh,
+                any(session != self._session_id for session, _ in self._active),
             )
-        self._active[attempt.number] = attempt
+        key = (self._session_id, attempt.number)
+        self._active[key] = attempt
         try:
             return await request
         except ClientResponseError:
@@ -188,7 +205,7 @@ class AuthDiagnosticSession:
             self._transport_failure(attempt, error)
             raise
         finally:
-            self._active.pop(attempt.number, None)
+            self._active.pop(key, None)
 
     def _timing(self, attempt: _Attempt) -> str:
         """Format only typed metadata, never an exception or request repr."""
@@ -198,7 +215,9 @@ class AuthDiagnosticSession:
             else None
         )
         return (
-            f"session={self._session_id} request={attempt.number} elapsed_s={elapsed} "
+            f"session={self._session_id} request={attempt.number} "
+            f"refresh_used={attempt.used[:8] if attempt.used else None} "
+            f"elapsed_s={elapsed} "
             f"http_status={attempt.status} access_expires_in_s_at_start={attempt.expires_in} "
             f"overlap_observed={attempt.overlap} "
             f"timeout_total_connect_sock_connect_sock_read_s={attempt.timeout}"
