@@ -52,11 +52,14 @@ class LocalSensorDescription(SensorEntityDescription):
     used.
 
     ``fallback_resources`` are read, in order, when ``resource`` is absent on
-    this appliance. With ``state_is_unknown`` a value the payload declares as a
-    named state (e.g. ``{"LOW_FLOW": 65535}``) is a marker, not a reading: the
-    value becomes None, which makes the entity unavailable (see ``available``)
-    instead of showing the raw number. ``invalid_values`` are sentinels that
-    carry no state list, such as the -3276.8 W of an absent power reading.
+    this appliance. A number the payload declares as a named state (e.g.
+    ``{"LOW_FLOW": 65535}`` or ``[{"open": -32768}, {"short": 32767}]``) is a
+    marker, not a reading: the value becomes None, which makes the entity
+    unavailable (see ``available``) instead of showing the raw number. This
+    does not suit a resource whose state map names the readings themselves,
+    as some ``/signals`` do (``{"ON": 1, "OFF": 0}``); none is read here.
+    ``invalid_values`` are sentinels that carry no state list, such as the
+    -3276.8 W of an absent power reading.
 
     ``states`` maps the gateway's raw strings to translatable state keys and
     makes the sensor an enum of those keys; a raw value outside the map is no
@@ -70,7 +73,6 @@ class LocalSensorDescription(SensorEntityDescription):
     resource: str
     field: str | None = None
     fallback_resources: tuple[str, ...] = ()
-    state_is_unknown: bool = False
     invalid_values: tuple[float, ...] = ()
     states: dict[str, str] | None = None
 
@@ -177,7 +179,6 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         # (65535) nearly all the time, while the signal matches the HMI.
         resource=HC1_PUMP_VOLUME_FLOW,
         fallback_resources=("/heatSources/hs1/pumpVolumeFlow",),
-        state_is_unknown=True,
         # The gateway reports l/h (API spec: unitOfMeasure "l/h").
         device_class=SensorDeviceClass.VOLUME_FLOW_RATE,
         native_unit_of_measurement=UnitOfVolumeFlowRate.LITERS_PER_HOUR,
@@ -227,13 +228,15 @@ LOCAL_SENSORS: tuple[LocalSensorDescription, ...] = (
 # Resources not every gateway serves. Unlike LOCAL_SENSORS, these are created
 # only once the gateway answers for them, so a system without, say, an energy
 # manager gets no permanently unavailable entity. States follow the
-# allowedValues of the K 40 RF OpenAPI spec.
+# allowedValues of the K 40 RF OpenAPI spec, plus the values a gateway answers
+# with where the two differ.
 LOCAL_OPTIONAL_SENSORS: tuple[LocalSensorDescription, ...] = (
     LocalSensorDescription(
         key="local_silent_mode_status",
         translation_key="local_silent_mode_status",
         resource="/system/powerConstraints/silentMode/status",
         entity_category=_DIAGNOSTIC,
+        states={"active": "active", "inactive": "inactive"},
     ),
     LocalSensorDescription(
         key="local_refrigerant_status",
@@ -249,6 +252,13 @@ LOCAL_OPTIONAL_SENSORS: tuple[LocalSensorDescription, ...] = (
             "shutoff": "shutoff",
             "alarm": "alarm",
             "test_mode": "test_mode",
+            # A K 40 RF on firmware 15.00.01 answers with the compressor
+            # status values instead: off, heating, cooling, dhw, pool,
+            # pool_heat, defrost, alarm.
+            "off": "off",
+            "dhw": "dhw",
+            "pool": "pool",
+            "pool_heat": "pool_heat",
         },
     ),
     LocalSensorDescription(
@@ -274,8 +284,6 @@ LOCAL_OPTIONAL_SENSORS: tuple[LocalSensorDescription, ...] = (
         device_class=_TEMP,
         native_unit_of_measurement=_CELSIUS,
         state_class=_MEASUREMENT,
-        # The spec declares open (-32768) and short (32768) sensor markers.
-        state_is_unknown=True,
     ),
     LocalSensorDescription(
         key="local_em_status",
@@ -287,6 +295,8 @@ LOCAL_OPTIONAL_SENSORS: tuple[LocalSensorDescription, ...] = (
             "inactive": "inactive",
             "activeCh": "active_ch",
             "activeDHW": "active_dhw",
+            # The spec spells it activeDHW, firmware 15.00.01 answers activeDhw.
+            "activeDhw": "active_dhw",
         },
     ),
     LocalSensorDescription(
@@ -399,7 +409,7 @@ class BoschComLocalSensor(CoordinatorEntity, SensorEntity):
             )
             return
         value = payload.get("value")
-        if description.state_is_unknown and value in _state_values(
+        if isinstance(value, (int, float)) and value in _state_values(
             payload.get("state")
         ):
             value = None

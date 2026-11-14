@@ -743,7 +743,11 @@
           "passive_defrost": "Passive defrost",
           "shutoff": "Shut off",
           "alarm": "Alarm",
-          "test_mode": "Test mode"
+          "test_mode": "Test mode",
+          "off": "Off",
+          "dhw": "Hot water",
+          "pool": "Pool",
+          "pool_heat": "Pool heating"
         }
       },
       "local_supply_setpoint": {
@@ -785,13 +789,11 @@
         }
       },
       "local_silent_mode_status": {
-        "name": "Local silent mode status"
-      },
-      "local_system_info": {
-        "name": "Local system information"
-      },
-      "local_module_details": {
-        "name": "{module} details"
+        "name": "Silent mode status",
+        "state": {
+          "active": "Active",
+          "inactive": "Inactive"
+        }
       }
     },
     "binary_sensor": {

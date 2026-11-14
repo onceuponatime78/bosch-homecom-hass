@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
+import re
 from typing import Any
 
 from aiohttp.client_exceptions import ClientConnectorError, ClientError
+from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_DEVICES, CONF_TOKEN, Platform
 from homeassistant.core import (
@@ -22,6 +24,8 @@ from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
@@ -84,6 +88,7 @@ from .coordinator import (
     BoschComModuleCoordinatorRrc2,
     BoschComModuleCoordinatorWddw2,
 )
+from .diagnostics import TO_REDACT_RAW, _mask_serial, _redact_raw_snapshot
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -645,6 +650,30 @@ def _find_bacon_client(hass: HomeAssistant) -> BaconMqttClient | None:
     return None
 
 
+def _admin_only(
+    hass: HomeAssistant,
+    handler: Callable[[ServiceCall], Awaitable[ServiceResponse]],
+) -> Callable[[ServiceCall], Awaitable[ServiceResponse]]:
+    """Restrict a debug service to admin users.
+
+    The debug services return raw cloud and MQTT payloads, so a non-admin user
+    must not be able to read them. HA's async_register_admin_service has no
+    supports_response, so this mirrors its check: calls without a user (scripts,
+    automations) run, a user that is not an admin is refused.
+    """
+
+    async def _checked(call: ServiceCall) -> ServiceResponse:
+        if call.context.user_id:
+            user = await hass.auth.async_get_user(call.context.user_id)
+            if user is None:
+                raise UnknownUser(context=call.context)
+            if not user.is_admin:
+                raise Unauthorized(context=call.context)
+        return await handler(call)
+
+    return _checked
+
+
 async def async_setup(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Add custom action."""
 
@@ -712,7 +741,7 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN,
         "get_custom_path_service",
-        get_custom_path_service,
+        _admin_only(hass, get_custom_path_service),
         supports_response=SupportsResponse.ONLY,
     )
 
@@ -744,7 +773,7 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN,
         "get_recordings_service",
-        get_recordings_service,
+        _admin_only(hass, get_recordings_service),
         supports_response=SupportsResponse.ONLY,
     )
 
@@ -765,16 +794,20 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("Device %s is not a Matter/bacon device", device_id)
             return {}
         data = coordinator.data
+        # The shadow comes off the same MQTT account as capture_raw_service and
+        # may carry the same pairing and network fields.
         return {
-            "reported": getattr(data, "reported", None),
-            "desired": getattr(data, "desired", None),
+            "reported": async_redact_data(
+                getattr(data, "reported", None), TO_REDACT_RAW
+            ),
+            "desired": async_redact_data(getattr(data, "desired", None), TO_REDACT_RAW),
         }
 
     # Register our service with Home Assistant.
     hass.services.async_register(
         DOMAIN,
         "get_shadow_service",
-        get_shadow_service,
+        _admin_only(hass, get_shadow_service),
         supports_response=SupportsResponse.ONLY,
     )
 
@@ -816,17 +849,20 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         finally:
             client.remove_raw_listener(_record)
 
+        # The subscription covers the whole account, so the capture carries Matter
+        # pairing secrets, MAC/SSID and serials: redact as diagnostics does.
+        redacted = _redact_raw_snapshot(captured)
         return {
             "window_seconds": seconds,
-            "device_id": serial,
-            "topics_seen": sorted(captured),
-            "captured": captured,
+            "device_id": _mask_serial(serial) if serial else None,
+            "topics_seen": sorted(redacted),
+            "captured": redacted,
         }
 
     hass.services.async_register(
         DOMAIN,
         "capture_raw_service",
-        capture_raw_service,
+        _admin_only(hass, capture_raw_service),
         supports_response=SupportsResponse.ONLY,
     )
 

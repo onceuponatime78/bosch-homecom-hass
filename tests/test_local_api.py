@@ -1187,6 +1187,48 @@ async def test_pump_volume_flow_falls_back_and_hides_the_low_flow_marker(
     assert BoschComLocalSensor(coordinator, entry, flow).native_value is None
 
 
+def _temperature(value):
+    """A temperature payload as the K 40 RF serves it, with its sensor markers."""
+    return {
+        "type": "floatValue",
+        "writeable": 0,
+        "value": value,
+        "unitOfMeasure": "C",
+        "state": [{"short": 32767.0}, {"open": -32768.0}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("local_hot_gas_temp", 20.1, 20.1),
+        ("local_hot_gas_temp", 32767.0, None),
+        ("local_suction_gas_temp", -32768.0, None),
+        ("local_compressor_temp", 32767.0, None),
+        ("local_condenser_supply_temp", -32768.0, None),
+        ("local_additional_heater_flow_temp", 29.4, 29.4),
+        ("local_additional_heater_flow_temp", -32768.0, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_local_sensors_hide_the_markers_their_payload_declares(
+    hass, entry, device, firmware, key, value, expected
+):
+    """A value the payload lists as a named state is no reading (#222)."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    description = {d.key: d for d in (*LOCAL_SENSORS, *LOCAL_OPTIONAL_SENSORS)}[key]
+    coordinator.local_data = _local_device(
+        resources={description.resource: _temperature(value)}
+    )
+
+    sensor = BoschComLocalSensor(coordinator, entry, description)
+
+    assert sensor.native_value == expected
+    assert sensor.available is (expected is not None)
+
+
 @pytest.mark.asyncio
 async def test_local_source_sensor_reports_transport(hass, entry, device, firmware):
     """The diagnostic sensor exposes which transport served the last update."""
@@ -1252,6 +1294,10 @@ async def test_optional_local_sensors_appear_once_the_gateway_serves_them(
         ("local_system_type", "eHybrid", "e_hybrid"),
         ("local_system_bus", "EMS2_0", "ems2_0"),
         ("local_refrigerant_status", "passive_defrost", "passive_defrost"),
+        # What a K 40 RF on firmware 15.00.01 answers instead of the spec values.
+        ("local_refrigerant_status", "off", "off"),
+        ("local_refrigerant_status", "dhw", "dhw"),
+        ("local_em_status", "activeDhw", "active_dhw"),
         # A value the spec does not list is no reading, not an invalid enum state.
         ("local_em_status", "somethingNew", None),
     ],
@@ -1272,6 +1318,52 @@ async def test_enum_sensors_map_raw_values_to_state_keys(
     assert sensor.device_class == SensorDeviceClass.ENUM
     assert set(sensor.options) == set(description.states.values())
     assert sensor.native_value == state
+
+
+# allowedValues as a K 40 RF (firmware 15.00.01) serves them; both differ from
+# the OpenAPI spec.
+_GATEWAY_ALLOWED_VALUES = {
+    "local_refrigerant_status": [
+        "off",
+        "heating",
+        "cooling",
+        "dhw",
+        "pool",
+        "pool_heat",
+        "defrost",
+        "alarm",
+    ],
+    "local_em_status": ["notConnected", "inactive", "activeCh", "activeDhw"],
+}
+
+
+@pytest.mark.parametrize(("key", "allowed"), list(_GATEWAY_ALLOWED_VALUES.items()))
+@pytest.mark.asyncio
+async def test_enum_sensors_read_every_value_the_gateway_allows(
+    hass, entry, device, firmware, key, allowed
+):
+    """No value the gateway itself lists leaves the entity unavailable."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    description = _optional(key)
+
+    for raw in allowed:
+        coordinator.local_data = _local_device(
+            resources={
+                description.resource: {
+                    "id": description.resource,
+                    "type": "stringValue",
+                    "writeable": 0,
+                    "value": raw,
+                    "allowedValues": allowed,
+                }
+            }
+        )
+        sensor = BoschComLocalSensor(coordinator, entry, description)
+
+        assert sensor.native_value in sensor.options, raw
+        assert sensor.available is True, raw
 
 
 def test_every_enum_state_and_name_is_translated() -> None:
@@ -1535,6 +1627,31 @@ async def test_module_inventory_without_a_named_appliance_leaves_the_model(
     )
 
     assert "model" not in coordinator.device_info
+
+
+@pytest.mark.asyncio
+async def test_appliance_model_uses_the_entry_scoped_device_lookup(
+    hass, entry, device, firmware
+):
+    """Where the registry has it (HA 2026.8+), async_get_device is not called."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    # spec: an attribute outside the list, such as async_get_device, raises.
+    registry = Mock(spec=["async_get_device_by_identifier", "async_update_device"])
+    registry.async_get_device_by_identifier.return_value = Mock(id="device-1")
+
+    with patch(
+        "custom_components.bosch_homecom.coordinator.dr.async_get",
+        return_value=registry,
+    ):
+        coordinator._apply_appliance_model(_SPEC_MODULES)
+
+    registry.async_get_device_by_identifier.assert_called_once_with(
+        (DOMAIN, coordinator.unique_id), entry.entry_id
+    )
+    registry.async_update_device.assert_called_once_with(
+        "device-1", model="Compress CS6800iAW 12 E"
+    )
 
 
 @pytest.mark.asyncio
@@ -2456,3 +2573,39 @@ def test_overlay_keeps_the_mode_for_statuses_without_one() -> None:
 
     assert "operationMode" not in data.heating_circuits[0]
     assert data.dhw_circuits[0]["operationMode"] == {"value": "ownprogram"}
+
+
+@pytest.mark.asyncio
+async def test_local_silent_status_is_discovered_and_tracks_gateway(
+    hass, entry, device, firmware
+):
+    """The read-only silent status appears only when served, as an enum."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    entities, pending = [], []
+    for candidate in _local_optional_candidates(coordinator, entry):
+        _add_or_defer(candidate, entities, pending)
+    assert not any(
+        e.entity_description.key == "local_silent_mode_status" for e in entities
+    )
+    added = []
+    _add_pending_sensors_later(coordinator, entry, pending, added.extend)
+    resource = "/system/powerConstraints/silentMode/status"
+    coordinator.local_data = _local_device(resources={resource: {"value": "active"}})
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    silent = [
+        e for e in added if e.entity_description.key == "local_silent_mode_status"
+    ]
+    assert len(silent) == 1
+    sensor = silent[0]
+    assert sensor.device_class == SensorDeviceClass.ENUM
+    assert sensor.options == ["active", "inactive"]
+    assert sensor.native_value == "active"
+
+    coordinator.local_data = _local_device(resources={resource: {"value": "inactive"}})
+    sensor.set_attr()
+    assert sensor.native_value == "inactive"
+    coordinator.local_healthy = False
+    assert not sensor.available

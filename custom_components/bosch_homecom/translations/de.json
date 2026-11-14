@@ -744,7 +744,11 @@
           "passive_defrost": "Passives Abtauen",
           "shutoff": "Abgeschaltet",
           "alarm": "Alarm",
-          "test_mode": "Testbetrieb"
+          "test_mode": "Testbetrieb",
+          "off": "Aus",
+          "dhw": "Warmwasser",
+          "pool": "Pool",
+          "pool_heat": "Poolheizung"
         }
       },
       "local_supply_setpoint": {
@@ -786,13 +790,11 @@
         }
       },
       "local_silent_mode_status": {
-        "name": "Lokaler Leisemodus-Status"
-      },
-      "local_system_info": {
-        "name": "Lokale Systeminformationen"
-      },
-      "local_module_details": {
-        "name": "{module} Details"
+        "name": "Leisemodus-Status",
+        "state": {
+          "active": "Aktiv",
+          "inactive": "Inaktiv"
+        }
       }
     },
     "binary_sensor": {
