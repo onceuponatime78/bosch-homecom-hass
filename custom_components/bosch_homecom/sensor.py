@@ -66,12 +66,10 @@ from .coordinator import (
 from .local_sensor import (
     LOCAL_OPTIONAL_SENSORS,
     LOCAL_SENSORS,
-    BoschComLocalModuleSensor,
+    BoschComLocalModuleBusSensor,
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
-    BoschComLocalSystemInfoSensor,
     _state_values,
-    local_module_key,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -120,9 +118,8 @@ async def async_setup_entry(
                     coordinator=coordinator, config_entry=config_entry
                 )
             )
-            entities.append(BoschComLocalSystemInfoSensor(coordinator))
             entities.extend(
-                BoschComLocalModuleSensor(coordinator, module, index)
+                BoschComLocalModuleBusSensor(coordinator, module, index)
                 for index, module in enumerate(coordinator.local_modules or ())
             )
             _add_local_modules_later(coordinator, config_entry, async_add_entities)
@@ -4160,9 +4157,9 @@ def _add_pending_sensors_later(
 
 
 def _add_local_modules_later(coordinator, config_entry, async_add_entities) -> None:
-    """Discover modules that first appear after the platform was set up."""
+    """Add bus-address sensors for modules that appear after setup."""
     known = {
-        local_module_key(module, index)
+        coordinator.module_device_identifier(module, index)
         for index, module in enumerate(coordinator.local_modules or ())
     }
 
@@ -4170,10 +4167,12 @@ def _add_local_modules_later(coordinator, config_entry, async_add_entities) -> N
     def _add_new_modules() -> None:
         entities = []
         for index, module in enumerate(coordinator.local_modules or ()):
-            key = local_module_key(module, index)
+            key = coordinator.module_device_identifier(module, index)
             if key not in known:
                 known.add(key)
-                entities.append(BoschComLocalModuleSensor(coordinator, module, index))
+                entities.append(
+                    BoschComLocalModuleBusSensor(coordinator, module, index)
+                )
         if entities:
             async_add_entities(entities)
 

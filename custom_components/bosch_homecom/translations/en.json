@@ -793,6 +793,9 @@
           "active": "Active",
           "inactive": "Inactive"
         }
+      },
+      "local_module_bus": {
+        "name": "Bus address"
       }
     },
     "binary_sensor": {

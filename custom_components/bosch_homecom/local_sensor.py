@@ -14,9 +14,7 @@ beyond reliability.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import logging
-import re
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -32,10 +30,11 @@ from homeassistant.const import (
     UnitOfTime,
     UnitOfVolumeFlowRate,
 )
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homecom_alt import BHCLocalModule
 
-from .const import HC1_PUMP_VOLUME_FLOW
+from .const import DOMAIN, HC1_PUMP_VOLUME_FLOW
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -458,98 +457,23 @@ class BoschComLocalSourceSensor(CoordinatorEntity, SensorEntity):
         self.async_write_ha_state()
 
 
-def local_module_key(module: BHCLocalModule, index: int) -> str:
-    """Keep module identities stable across inventory reordering."""
-    identity = [value for value in (module.bus_id, module.token) if value is not None]
-    if not identity:
-        serial = module.module_serial or module.product_serial
-        identity = [serial] if serial is not None else [f"index-{index}"]
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", "-".join(identity))
-
-
-def _module_attributes(module: BHCLocalModule) -> dict[str, str]:
-    """Expose the library's module fields under their gateway resource names."""
-    return {
-        key: value
-        for key, value in (
-            ("Id", module.bus_id),
-            ("Tok", module.token),
-            ("ProductName", module.product_name),
-            ("Ver", module.version),
-            ("ModuleHwIdentStr", module.hw_ident),
-            ("ProductSerialNumber", module.product_serial),
-            ("ModuleSerialNumber", module.module_serial),
-        )
-        if value is not None
-    }
-
-
-class BoschComLocalSystemInfoSensor(CoordinatorEntity, SensorEntity):
-    """Display module models and firmware from the cached gateway inventory."""
+class BoschComLocalModuleBusSensor(CoordinatorEntity, SensorEntity):
+    """Show a gateway module's bus address (Id / Tok) on its sub-device."""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_translation_key = "local_system_info"
-    _attr_icon = "mdi:chip"
-
-    def __init__(self, coordinator) -> None:
-        """Initialize without making an additional gateway request."""
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{coordinator.unique_id}-local_system_info"
-        self._attr_device_info = coordinator.device_info
-
-    @property
-    def available(self) -> bool:
-        """Require a working local connection and a module inventory."""
-        return self.coordinator.local_healthy and bool(self.coordinator.local_modules)
-
-    @property
-    def native_value(self) -> str | None:
-        """Return the inventory summary within Home Assistant's state limit."""
-        summary = []
-        for module in self.coordinator.local_modules or ():
-            name = module.product_name or module.hw_ident or module.bus_id
-            if name is not None:
-                summary.append(f"{name} ({module.version})" if module.version else name)
-        return "; ".join(summary)[:255] or None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Retain the full parsed inventory when the display summary is truncated."""
-        return {
-            "values": [
-                _module_attributes(module)
-                for module in self.coordinator.local_modules or ()
-            ]
-        }
-
-
-class BoschComLocalModuleSensor(CoordinatorEntity, SensorEntity):
-    """Display one module's fields, retaining its stable bus identity."""
-
-    _attr_has_entity_name = True
-    _attr_should_poll = False
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_translation_key = "local_module_details"
+    _attr_translation_key = "local_module_bus"
     _attr_icon = "mdi:chip"
 
     def __init__(self, coordinator, module: BHCLocalModule, index: int) -> None:
-        """Initialize a sensor whose unique ID matches the original local sensors."""
+        """Attach to the module's sub-device, keyed like that device."""
         super().__init__(coordinator)
-        self._module_key = local_module_key(module, index)
-        name = (
-            module.product_name
-            or module.hw_ident
-            or f"Module {module.bus_id or index + 1}"
+        self._device_identifier = coordinator.module_device_identifier(module, index)
+        self._attr_unique_id = f"{self._device_identifier}-bus"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._device_identifier)}
         )
-        if module.bus_id is not None or module.token is not None:
-            name = f"{name} ({module.bus_id or '-'} / {module.token or '-'})"
-        self._attr_translation_placeholders = {"module": name}
-        self._attr_unique_id = (
-            f"{coordinator.unique_id}-local-module-{self._module_key}"
-        )
-        self._attr_device_info = coordinator.device_info
 
     def _module(self) -> BHCLocalModule | None:
         """Find this module in the latest cached inventory."""
@@ -557,27 +481,21 @@ class BoschComLocalModuleSensor(CoordinatorEntity, SensorEntity):
             (
                 module
                 for index, module in enumerate(self.coordinator.local_modules or ())
-                if local_module_key(module, index) == self._module_key
+                if self.coordinator.module_device_identifier(module, index)
+                == self._device_identifier
             ),
             None,
         )
 
     @property
     def available(self) -> bool:
-        """A removed module or unreachable gateway cannot supply a live reading."""
+        """A removed module or unreachable gateway cannot supply a reading."""
         return self.coordinator.local_healthy and self._module() is not None
 
     @property
     def native_value(self) -> str | None:
-        """Show the module fields directly, with the full record in attributes."""
-        fields = [
-            f"{key}: {json.dumps(value, ensure_ascii=False)}"
-            for key, value in self.extra_state_attributes.items()
-        ]
-        return "; ".join(fields)[:255] or None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose all fields the library parsed for this module."""
+        """Return the bus ID and token, e.g. ``65281 / 8``."""
         module = self._module()
-        return _module_attributes(module) if module is not None else {}
+        if module is None or (module.bus_id is None and module.token is None):
+            return None
+        return f"{module.bus_id or '-'} / {module.token or '-'}"
