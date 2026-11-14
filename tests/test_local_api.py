@@ -2650,6 +2650,7 @@ async def test_module_bus_sensors_sit_on_sub_devices_and_discover_late_modules(
     coordinator.local_healthy = False
     assert not outdoor.available
 
+
 # A CS5800iAW's real inventory (serials replaced): the K40RF is listed twice,
 # at 15.00 and at the gateway's running 15.00.01, plus an HMI without a name.
 _CS5800_MODULES = (
