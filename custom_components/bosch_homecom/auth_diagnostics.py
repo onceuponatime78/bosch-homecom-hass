@@ -45,6 +45,9 @@ _REPEAT_INTERVAL = 900
 # deadline tells a request that never left (safe to repeat) from one that
 # may have been processed.
 TOKEN_TIMEOUT = ClientTimeout(total=60, sock_connect=10)
+# homecom_alt's own deadline. A reply slower than this would have been lost
+# without TOKEN_TIMEOUT, so it is logged where default log levels show it.
+LIBRARY_TOKEN_TIMEOUT_S = 15
 # OAuth exchanges in flight, per config entry and across its setups: a reload
 # builds a new session while the old instance may still be refreshing, and that
 # overlap spends one refresh token twice. Keyed by (session id, request number).
@@ -296,8 +299,15 @@ class AuthDiagnosticSession:
             )
             self._last_failure = None
             self._uncertain = None
-            _LOGGER.info(
-                "OAuth token exchange succeeded for entry %s; refresh_token_rotated=%s; %s",
+            slow = (
+                attempt.started is not None
+                and time.monotonic() - attempt.started > LIBRARY_TOKEN_TIMEOUT_S
+            )
+            _LOGGER.log(
+                logging.WARNING if slow else logging.INFO,
+                "OAuth token exchange succeeded%s for entry %s; "
+                "refresh_token_rotated=%s; %s",
+                f" after more than {LIBRARY_TOKEN_TIMEOUT_S} s" if slow else "",
                 self._entry_id,
                 self._last_issued is not None and self._last_issued != attempt.used,
                 self._timing(attempt),

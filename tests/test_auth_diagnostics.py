@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import itertools
 import logging
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -103,6 +104,34 @@ async def test_successful_rotation_is_correlated_and_response_remains_readable(
     assert f"refresh_matches_last_issued={not use_stale_refresh}" in caplog.text
     assert "last_success=not observed" not in caplog.text
     assert "new-refresh-secret" not in caplog.text
+
+
+@pytest.mark.parametrize(("elapsed", "level"), [(3, "INFO"), (20, "WARNING")])
+async def test_slow_token_reply_is_logged_as_warning(caplog, elapsed, level):
+    """A reply the library's 15 s deadline would have dropped stays visible."""
+    caplog.set_level(logging.INFO)
+    raw = Mock()
+    wrapped = AuthDiagnosticSession(raw, "test-entry")
+    response = _response(200, {"access_token": "a", "refresh_token": "r"})
+
+    async def request(method, url, **kwargs):
+        await kwargs["raise_for_status"](response)
+        return response
+
+    raw.request = Mock(side_effect=request)
+    client = HomeComAlt(
+        wrapped, ConnectionOptions(token="old", refresh_token="old-r"), True
+    )
+    clock = itertools.chain([100.0], itertools.repeat(100.0 + elapsed))
+    with patch(
+        "custom_components.bosch_homecom.auth_diagnostics.time.monotonic",
+        side_effect=lambda: next(clock),
+    ):
+        assert await client.get_token(force=True)
+
+    (record,) = [r for r in caplog.records if "exchange succeeded" in r.message]
+    assert record.levelname == level
+    assert f"elapsed_s={float(elapsed)}" in record.message
 
 
 async def test_warning_deduplication_and_unknown_error_never_leak_values(caplog):
