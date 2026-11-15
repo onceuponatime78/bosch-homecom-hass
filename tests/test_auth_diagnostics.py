@@ -17,7 +17,10 @@ from homecom_alt.const import OAUTH_DOMAIN, OAUTH_ENDPOINT
 import jwt
 import pytest
 
-from custom_components.bosch_homecom.auth_diagnostics import AuthDiagnosticSession
+from custom_components.bosch_homecom.auth_diagnostics import (
+    TOKEN_TIMEOUT,
+    AuthDiagnosticSession,
+)
 
 TOKEN_URL = OAUTH_DOMAIN + OAUTH_ENDPOINT
 
@@ -163,7 +166,7 @@ async def test_transport_failure_records_original_type_duration_and_deadline(
     """Observe errors before homecom_alt wraps them in NotRespondingError."""
     raw = Mock()
     wrapped = AuthDiagnosticSession(raw, "test-entry")
-    raw.request = Mock(side_effect=AsyncMock(side_effect=error))
+    request = raw.request = Mock(side_effect=AsyncMock(side_effect=error))
     with patch(
         "custom_components.bosch_homecom.auth_diagnostics.time",
         Mock(monotonic=Mock(side_effect=[100.0, 110.0, 110.0])),
@@ -181,7 +184,9 @@ async def test_transport_failure_records_original_type_duration_and_deadline(
     assert f"phase={phase}" in caplog.text
     assert f"server_processing_uncertain={uncertain}" in caplog.text
     assert "elapsed_s=10.0" in caplog.text
-    assert "(10, 3, None, 7)" in caplog.text
+    # The caller's 15 s total is replaced by the token deadline.
+    assert request.call_args.kwargs["timeout"] is TOKEN_TIMEOUT
+    assert "(60, None, 10, None)" in caplog.text
     assert "secret" not in caplog.text
 
 

@@ -689,8 +689,39 @@ async def test_stored_tokens_win_when_both_sides_rotated(
     assert "not saving the tokens this instance rotated" in caplog.text
 
 
+async def test_rejected_refresh_token_is_not_resent_every_poll(
+    hass, entry, bhc, device, firmware, freezer
+):
+    """A dead refresh token waits an hour; a reauth's new one is used at once."""
+    entry.add_to_hass(hass)
+    bhc.token = "mock_token"
+    bhc.refresh_token = "mock_refresh"
+    coordinator = BoschComModuleCoordinatorRac(hass, bhc, device, firmware, entry, True)
+    entry.async_start_reauth = Mock()
+    bhc.get_token = AsyncMock(side_effect=AuthFailedError("Failed to refresh"))
+
+    for _ in range(5):
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+    assert bhc.get_token.await_count == 1
+
+    freezer.tick(timedelta(minutes=61))
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
+    assert bhc.get_token.await_count == 2
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_TOKEN: "reauth_token", CONF_REFRESH: "reauth"}
+    )
+    bhc.get_token = AsyncMock()
+    bhc.async_update = AsyncMock(return_value=_make_rac_data(device, firmware))
+    await coordinator._async_update_data()
+    bhc.get_token.assert_awaited_once()
+    assert bhc.refresh_token == "reauth"
+
+
 async def test_refresh_failure_and_recovery_visible_without_debug(
-    hass, entry, bhc, device, firmware, caplog
+    hass, entry, bhc, device, firmware, caplog, freezer
 ):
     """Local fallback must not hide auth failures or expose exception secrets."""
     entry.add_to_hass(hass)
@@ -707,6 +738,8 @@ async def test_refresh_failure_and_recovery_visible_without_debug(
     assert "access-secret" not in caplog.text
     assert "exception-secret" not in caplog.text
 
+    # The rejected token is only retried after REJECTED_REFRESH_RETRY_INTERVAL.
+    freezer.tick(timedelta(hours=1, minutes=1))
     bhc.get_token = AsyncMock()
     bhc.async_update = AsyncMock(return_value=_make_rac_data(device, firmware))
     await coordinator._async_update_data()

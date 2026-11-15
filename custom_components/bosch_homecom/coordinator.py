@@ -93,6 +93,7 @@ from .const import (
     RECORDING_PATHS,
     RECORDINGS_POLL_INTERVAL,
     RECORDINGS_PREVIOUS_DAY_TRIES,
+    REJECTED_REFRESH_RETRY_INTERVAL,
     WDDW2_HEALTH_STATUS_PATH,
     WDDW2_RECORDINGS_POLL_INTERVAL,
     WDDW2_WATER_TODAY_KEY,
@@ -146,6 +147,9 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         # The token pair this instance last read from or wrote to the entry.
         # The entry is the source of truth: a reauth, or another setup of this
         # entry during a reload, may store newer tokens there at any time.
+        # The refresh token SingleKey last rejected, and when, so the dead token
+        # is not sent again on every poll (REJECTED_REFRESH_RETRY_INTERVAL).
+        self._rejected_refresh: tuple[str, datetime] | None = None
         self._synced_tokens: tuple[str | None, str | None] = (
             getattr(bhc, "token", None),
             getattr(bhc, "refresh_token", None),
@@ -224,10 +228,19 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
         if not self.auth_provider:
             return
         self._async_adopt_stored_tokens()
+        rejected = self._rejected_refresh
+        if (
+            rejected is not None
+            and rejected[0] == self.bhc.refresh_token
+            and dt_util.utcnow() - rejected[1] < REJECTED_REFRESH_RETRY_INTERVAL
+        ):
+            raise UpdateFailed("Re-authentication required")
         try:
             await self.bhc.get_token()
         except AuthFailedError:
             self._log_refresh_failure("authentication rejected")
+            if self.bhc.refresh_token:
+                self._rejected_refresh = (self.bhc.refresh_token, dt_util.utcnow())
             self.entry.async_start_reauth(self.hass)
             raise UpdateFailed("Re-authentication required") from None
         except (ApiError, NotRespondingError, RetryError, TimeoutError) as error:
@@ -237,6 +250,7 @@ class BoschComModuleCoordinatorBase(DataUpdateCoordinator[T]):
             # have rotated it before the response was lost. The request-level
             # diagnostics preserve the failure phase and timing for that case.
             raise UpdateFailed(f"Token refresh failed: {error}") from error
+        self._rejected_refresh = None
         self._async_persist_tokens()
         if self._auth_failure_logged:
             _LOGGER.warning("Device_Id: %s, OAuth refresh recovered", self.unique_id)

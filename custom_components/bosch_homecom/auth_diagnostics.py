@@ -39,6 +39,12 @@ _ERROR_CODES = {
     "temporarily_unavailable",
 }
 _REPEAT_INTERVAL = 900
+# Deadline for OAuth token exchanges, replacing homecom_alt's 15 s total. A
+# refresh SingleKey processed but whose reply was cut off leaves only a spent
+# refresh token behind, so a slow reply is waited for. The separate connect
+# deadline tells a request that never left (safe to repeat) from one that
+# may have been processed.
+TOKEN_TIMEOUT = ClientTimeout(total=60, sock_connect=10)
 # OAuth exchanges in flight, per config entry and across its setups: a reload
 # builds a new session while the old instance may still be refreshing, and that
 # overlap spends one refresh token twice. Keyed by (session id, request number).
@@ -139,7 +145,7 @@ class AuthDiagnosticSession:
                 if isinstance(authorization, str)
                 else None
             )
-            timeout = kwargs.get("timeout", self._session.timeout)
+            kwargs["timeout"] = timeout = TOKEN_TIMEOUT
             limits = (
                 (
                     timeout.total,
