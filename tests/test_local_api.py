@@ -28,15 +28,20 @@ from homecom_alt import (
     ProximityRequiredError,
     TokenStoreFullError,
 )
+from homecom_alt.const import LOCAL_POLL_RESOURCES
 import pytest
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     MockEntityPlatform,
 )
 
-from custom_components.bosch_homecom import _local_only_devices
+from custom_components.bosch_homecom import (
+    _local_only_devices,
+    async_remove_config_entry_device,
+)
 from custom_components.bosch_homecom.binary_sensor import (
     BoschComK40LocalOnOffSensor,
+    BoschComK40LocalPrimaryLowFlowSensor,
     BoschComK40LocalPumpStatusSensor,
     async_setup_entry as binary_sensor_async_setup_entry,
 )
@@ -53,9 +58,14 @@ from custom_components.bosch_homecom.const import (
     CONF_LOCAL_TOKEN_ID,
     CONF_REFRESH,
     DOMAIN,
+    HC1_FLOW_TEMP_SETPOINT,
     HC1_PUMP_VOLUME_FLOW,
     HC_TUNE_ENDPOINTS,
+    HEAT_CARRIER_PUMP_SPEED,
+    HEAT_OUTPUT,
+    LOCAL_GATEWAY_HARDWARE,
     MAX_CLOUD_FAILURES_WITH_LOCAL,
+    PRIMARY_PUMP_VOLUME_FLOW,
 )
 from custom_components.bosch_homecom.coordinator import (
     BoschComModuleCoordinatorK40,
@@ -72,6 +82,7 @@ from custom_components.bosch_homecom.local_sensor import (
     BoschComLocalSensor,
     BoschComLocalSourceSensor,
     _emon_field,
+    is_low_flow,
 )
 from custom_components.bosch_homecom.sensor import (
     _add_local_modules_later,
@@ -981,7 +992,15 @@ async def test_local_pump_entities_wait_for_served_circuit(
     entities = []
 
     await binary_sensor_async_setup_entry(hass, entry, entities.extend)
-    assert [e._resource for e in entities] == ["/heatingCircuits/hc1/pumpStatus"]
+
+    def pumps():
+        return [
+            e._resource
+            for e in entities
+            if isinstance(e, BoschComK40LocalPumpStatusSensor)
+        ]
+
+    assert pumps() == ["/heatingCircuits/hc1/pumpStatus"]
 
     coordinator.local_data = _local_device(
         resources={
@@ -991,7 +1010,7 @@ async def test_local_pump_entities_wait_for_served_circuit(
     )
     coordinator.async_update_listeners()
     coordinator.async_update_listeners()
-    assert [e._resource for e in entities] == [
+    assert pumps() == [
         "/heatingCircuits/hc1/pumpStatus",
         "/heatingCircuits/hc2/pumpStatus",
     ]
@@ -1228,6 +1247,210 @@ async def test_local_sensors_hide_the_markers_their_payload_declares(
 
     assert sensor.native_value == expected
     assert sensor.available is (expected is not None)
+
+
+@pytest.mark.asyncio
+async def test_primary_pump_volume_flow_reads_the_heat_source_circuit(
+    hass, entry, device, firmware
+):
+    """With a buffer the heat source circuit carries its own flow.
+
+    Values from a CS5800iAW whose buffer separates the circuits: 1224 l/h on
+    the heat source side while the heating circuit carried 882 l/h.
+    """
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    by_key = {d.key: d for d in (*LOCAL_SENSORS, *LOCAL_OPTIONAL_SENSORS)}
+    coordinator.local_data = _local_device(
+        resources={
+            HC1_PUMP_VOLUME_FLOW: _flow(882, {"LOW_FLOW": 65535}),
+            PRIMARY_PUMP_VOLUME_FLOW: _flow(1224, [{"lowflow": 65535}]),
+        }
+    )
+    coordinator.local_healthy = True
+
+    primary = BoschComLocalSensor(
+        coordinator, entry, by_key["local_primary_pump_volume_flow"]
+    )
+    heating = BoschComLocalSensor(coordinator, entry, by_key["local_pump_volume_flow"])
+    assert primary.native_value == 1224
+    assert heating.native_value == 882
+    assert by_key["local_primary_pump_volume_flow"].native_unit_of_measurement == "L/h"
+
+    coordinator.local_data = _local_device(
+        resources={PRIMARY_PUMP_VOLUME_FLOW: _flow(65535, [{"lowflow": 65535}])}
+    )
+    primary.set_attr()
+    assert primary.native_value is None
+    assert not primary.available
+
+    coordinator.local_data = _local_device(
+        resources={PRIMARY_PUMP_VOLUME_FLOW: _flow(0, [{"lowflow": 65535}])}
+    )
+    primary.set_attr()
+    assert primary.native_value == 0
+    assert primary.available
+
+
+def test_is_low_flow() -> None:
+    """A marker value is flagged, a reading is not, a missing value is unknown."""
+    assert is_low_flow(_flow(65535, [{"lowflow": 65535}])) is True
+    assert is_low_flow(_flow(65535, {"LOW_FLOW": 65535})) is True
+    assert is_low_flow(_flow(957, [{"lowflow": 65535}])) is False
+    assert is_low_flow(_flow(0, [{"lowflow": 65535}])) is False
+    assert is_low_flow({"value": 12}) is False
+    assert is_low_flow({"value": None}) is None
+    assert is_low_flow(None) is None
+    # Another declared marker is no reading, not a low flow.
+    assert is_low_flow(_flow(32767, [{"lowflow": 65535}, {"short": 32767}])) is None
+    assert is_low_flow({"value": "on"}) is None
+
+
+@pytest.mark.asyncio
+async def test_primary_low_flow_binary_sensor(hass, entry, device, firmware, caplog):
+    """The LOW_FLOW marker becomes on, a reading off, no resource unavailable."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+
+    def sensor_for(payload):
+        resources = {PRIMARY_PUMP_VOLUME_FLOW: payload} if payload else {}
+        coordinator.local_data = _local_device(resources=resources)
+        return BoschComK40LocalPrimaryLowFlowSensor(coordinator)
+
+    low = sensor_for(_flow(65535, [{"lowflow": 65535}]))
+    assert low.is_on is True and low.available
+    measured = sensor_for(_flow(1224, [{"lowflow": 65535}]))
+    assert measured.is_on is False and measured.available
+    stopped = sensor_for(_flow(0, [{"lowflow": 65535}]))
+    assert stopped.is_on is False and stopped.available
+    missing = sensor_for(None)
+    assert missing.is_on is None and not missing.available
+    coordinator.local_healthy = False
+    assert not low.available
+
+    platform = MockEntityPlatform(hass, domain="binary_sensor", platform_name=DOMAIN)
+    await platform.async_add_entities([low])
+    assert "Error adding entity" not in caplog.text
+    assert er.async_get(hass).async_get(low.entity_id).disabled_by is not None
+
+
+@pytest.mark.asyncio
+async def test_primary_low_flow_binary_sensor_only_with_local_access(
+    hass, entry, device, firmware
+):
+    """The binary sensor is set up once the gateway serves the heat source flow."""
+    entry.add_to_hass(hass)
+    served = {PRIMARY_PUMP_VOLUME_FLOW: _flow(1224, [{"lowflow": 65535}])}
+    for local, resources, expected in (
+        (True, served, 1),
+        (True, {}, 0),
+        (False, served, 0),
+    ):
+        coordinator, _ = _coordinator(hass, entry, device, firmware, local=local)
+        coordinator.local_data = _local_device(resources=resources)
+        coordinator.async_set_updated_data(_cloud_device())
+        entry.runtime_data = [coordinator]
+        entities: list = []
+        await binary_sensor_async_setup_entry(hass, entry, entities.extend)
+        found = [
+            e for e in entities if isinstance(e, BoschComK40LocalPrimaryLowFlowSensor)
+        ]
+        assert len(found) == expected
+
+
+@pytest.mark.asyncio
+async def test_heat_carrier_pump_speed(hass, entry, device, firmware):
+    """The PC0 pump speed, as the gateway serves it."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_data = _local_device(
+        resources={
+            HEAT_CARRIER_PUMP_SPEED: {
+                "type": "integerValue",
+                "value": 25,
+                "unitOfMeasure": "%",
+            },
+        }
+    )
+    coordinator.local_healthy = True
+    by_key = {d.key: d for d in (*LOCAL_SENSORS, *LOCAL_OPTIONAL_SENSORS)}
+
+    speed = BoschComLocalSensor(
+        coordinator, entry, by_key["local_heat_carrier_pump_speed"]
+    )
+    assert speed.native_value == 25
+
+    coordinator.local_data = _local_device()
+    speed.set_attr()
+    assert speed.native_value is None and not speed.available
+
+
+@pytest.mark.asyncio
+async def test_heat_output_reads_the_calculated_signal(hass, entry, device, firmware):
+    """The appliance's calculated heat output, in kW."""
+    description = _optional("local_heat_output")
+    assert description.native_unit_of_measurement == "kW"
+    assert description.device_class == "power"
+    assert description.state_class == "measurement"
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+
+    coordinator.local_data = _local_device(
+        resources={
+            HEAT_OUTPUT: {"type": "floatValue", "value": 1.5, "unitOfMeasure": "kW"}
+        }
+    )
+    sensor = BoschComLocalSensor(coordinator, entry, description)
+    assert sensor.native_value == 1.5 and sensor.available
+
+    coordinator.local_data = _local_device()
+    sensor.set_attr()
+    assert sensor.native_value is None and not sensor.available
+
+
+@pytest.mark.asyncio
+async def test_hc1_flow_temp_setpoint(hass, entry, device, firmware):
+    """The HC1 supply setpoint; its off markers are no setpoint."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    by_key = {d.key: d for d in (*LOCAL_SENSORS, *LOCAL_OPTIONAL_SENSORS)}
+    markers = {"OFF_HEAT": 0, "OFF_COOL": 90}
+
+    def hc1(value):
+        return {"type": "integerValue", "value": value, "unitOfMeasure": "C"} | {
+            "state": markers
+        }
+
+    coordinator.local_data = _local_device(
+        resources={
+            HC1_FLOW_TEMP_SETPOINT: hc1(28),
+        }
+    )
+    circuit = BoschComLocalSensor(
+        coordinator, entry, by_key["local_hc1_flow_temp_setpoint"]
+    )
+    assert circuit.native_value == 28
+
+    for off in (0, 90):
+        coordinator.local_data = _local_device(
+            resources={HC1_FLOW_TEMP_SETPOINT: hc1(off)}
+        )
+        circuit.set_attr()
+        assert circuit.native_value is None
+
+
+def test_heat_source_circuit_resources_come_with_the_poll() -> None:
+    """homecom_alt polls every resource these sensors read; nothing extra."""
+    for path in (
+        PRIMARY_PUMP_VOLUME_FLOW,
+        HEAT_CARRIER_PUMP_SPEED,
+        HEAT_OUTPUT,
+        HC1_FLOW_TEMP_SETPOINT,
+    ):
+        assert path in LOCAL_POLL_RESOURCES
 
 
 @pytest.mark.asyncio
@@ -1545,9 +1768,10 @@ _SPEC_MODULES = (
 )
 
 
-# The gateway identity resources, values as in the K 40 RF OpenAPI spec.
+# The gateway hardware resources read with the inventory, values as in the
+# K 40 RF OpenAPI spec. Brand and firmware come with the local poll.
+_SPEC_GATEWAY_BRAND = {"/gateway/brand": {"value": "Buderus"}}
 _SPEC_GATEWAY_IDENTITY = {
-    "/gateway/brand": {"value": "Buderus"},
     "/gateway/versionHardware": {"value": "K30RF_v1"},
     "/gateway/eth/mac": {"value": "48:F1:7F:59:E3:36"},
     "/gateway/wifi/mac": {"value": "00:00:00:00:00:00"},
@@ -2318,6 +2542,72 @@ async def test_cloud_back_reloads_an_entry_set_up_without_it(
     assert coordinator.cloud_setup_pending is False
 
 
+def _local_only_update() -> K40Update:
+    return K40Update(
+        local=_local_device(resources=_resource(OUTDOOR, 7.1)),
+        cloud=None,
+        source="local",
+        local_healthy=True,
+        cloud_error="504",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_down_at_the_first_refresh_reloads_once_it_answers(
+    hass, entry, device, firmware
+):
+    """Token fine, first cloud read failed: only the skeleton reached the
+    platforms, so the cloud-only entities are missing until a reload."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    both = K40Update(
+        local=_local_device(),
+        cloud=_cloud_device(),
+        source="both",
+        local_healthy=True,
+    )
+    coordinator.local_first.async_update = AsyncMock(
+        side_effect=[_local_only_update(), both, both]
+    )
+
+    coordinator.data = await coordinator._async_update_data()
+    assert coordinator.cloud_setup_pending is True
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        coordinator.data = await coordinator._async_update_data()
+        coordinator.data = await coordinator._async_update_data()
+
+    reload.assert_called_once_with(entry.entry_id)
+    assert coordinator.cloud_setup_pending is False
+
+
+@pytest.mark.asyncio
+async def test_cloud_outage_after_setup_does_not_reload(hass, entry, device, firmware):
+    """The entities exist already: a later outage, even past the hold, and
+    the cloud coming back need no reload."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.data = _cloud_with_circuits()
+    coordinator.local_first.async_update = AsyncMock(
+        side_effect=[_local_only_update()] * (MAX_CLOUD_FAILURES_WITH_LOCAL + 2)
+        + [
+            K40Update(
+                local=_local_device(),
+                cloud=_cloud_device(),
+                source="both",
+                local_healthy=True,
+            )
+        ]
+    )
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        for _ in range(MAX_CLOUD_FAILURES_WITH_LOCAL + 3):
+            coordinator.data = await coordinator._async_update_data()
+
+    assert coordinator.cloud_setup_pending is False
+    reload.assert_not_called()
+
+
 def _local_entry(**data):
     return MockConfigEntry(
         domain=DOMAIN,
@@ -2475,42 +2765,6 @@ def test_overlay_keeps_the_mode_for_statuses_without_one() -> None:
     assert data.dhw_circuits[0]["operationMode"] == {"value": "ownprogram"}
 
 
-@pytest.mark.asyncio
-async def test_local_silent_status_is_discovered_and_tracks_gateway(
-    hass, entry, device, firmware
-):
-    """The read-only silent status appears only when served, as an enum."""
-    entry.add_to_hass(hass)
-    coordinator, _ = _coordinator(hass, entry, device, firmware)
-    coordinator.local_healthy = True
-    entities, pending = [], []
-    for candidate in _local_optional_candidates(coordinator, entry):
-        _add_or_defer(candidate, entities, pending)
-    assert not any(
-        e.entity_description.key == "local_silent_mode_status" for e in entities
-    )
-    added = []
-    _add_pending_sensors_later(coordinator, entry, pending, added.extend)
-    resource = "/system/powerConstraints/silentMode/status"
-    coordinator.local_data = _local_device(resources={resource: {"value": "active"}})
-    coordinator.async_update_listeners()
-    coordinator.async_update_listeners()
-    silent = [
-        e for e in added if e.entity_description.key == "local_silent_mode_status"
-    ]
-    assert len(silent) == 1
-    sensor = silent[0]
-    assert sensor.device_class == SensorDeviceClass.ENUM
-    assert sensor.options == ["active", "inactive"]
-    assert sensor.native_value == "active"
-
-    coordinator.local_data = _local_device(resources={resource: {"value": "inactive"}})
-    sensor.set_attr()
-    assert sensor.native_value == "inactive"
-    coordinator.local_healthy = False
-    assert not sensor.available
-
-
 def _module_devices(hass, entry, coordinator):
     """The module sub-devices registered for ``entry``, by model_id."""
     registry = dr.async_get(hass)
@@ -2536,10 +2790,15 @@ async def test_modules_become_sub_devices_of_the_appliance(
     coordinator.local_client.async_get_resources = AsyncMock(
         return_value=_SPEC_GATEWAY_IDENTITY
     )
+    coordinator.local_data = _local_device(resources=_SPEC_GATEWAY_BRAND)
     coordinator.local_healthy = True
 
     await coordinator._fetch_local_modules()
 
+    # Only the hardware identity is read again; brand and firmware are polled.
+    coordinator.local_client.async_get_resources.assert_awaited_once_with(
+        LOCAL_GATEWAY_HARDWARE
+    )
     devices = _module_devices(hass, entry, coordinator)
     assert set(devices) == {"XCU_THH", "XCU_SRH", "K40RF"}
     outdoor = devices["XCU_SRH"]
@@ -2617,41 +2876,6 @@ def test_module_key_never_uses_the_serial() -> None:
     assert local_module_key(_module(product_serial="8370"), 4) == "index-4"
 
 
-@pytest.mark.asyncio
-async def test_module_bus_sensors_sit_on_sub_devices_and_discover_late_modules(
-    hass, entry, device, firmware
-):
-    """Fork-only: each module shows its bus address on its own sub-device."""
-    entry.add_to_hass(hass)
-    coordinator, _ = _coordinator(hass, entry, device, firmware)
-    coordinator.local_healthy = True
-    coordinator.local_modules = _SPEC_MODULES[:2]
-    sensors = [
-        BoschComLocalModuleBusSensor(coordinator, module, index)
-        for index, module in enumerate(coordinator.local_modules)
-    ]
-    outdoor = sensors[1]
-    assert outdoor.native_value == "65281 / 8"
-    assert outdoor.unique_id == f"{coordinator.unique_id}-module-65281-8-bus"
-    assert outdoor.device_info["identifiers"] == {
-        (DOMAIN, f"{coordinator.unique_id}-module-65281-8")
-    }
-    assert "8370374" not in outdoor.unique_id
-
-    added = []
-    _add_local_modules_later(coordinator, entry, added.extend)
-    coordinator.local_modules = _SPEC_MODULES
-    coordinator.async_update_listeners()
-    coordinator.async_update_listeners()
-    assert [s.native_value for s in added] == ["17 / 72"]
-
-    coordinator.local_modules = _SPEC_MODULES[1:]
-    assert outdoor.available
-    assert not sensors[0].available
-    coordinator.local_healthy = False
-    assert not outdoor.available
-
-
 # A CS5800iAW's real inventory (serials replaced): the K40RF is listed twice,
 # at 15.00 and at the gateway's running 15.00.01, plus an HMI without a name.
 _CS5800_MODULES = (
@@ -2693,11 +2917,28 @@ _CS5800_MODULES = (
 )
 
 
+def _cs5800_identity():
+    return {
+        "/gateway/versionHardware": "K40RF_v1",
+        "/gateway/eth/mac": "f0:4a:3d:00:00:20",
+        "/gateway/wifi/mac": "f0:4a:3d:00:00:21",
+    }
+
+
+def _cs5800_poll(firmware="15.00.01"):
+    return _local_device(
+        resources={
+            "/gateway/brand": {"value": "Bosch"},
+            "/gateway/versionFirmware": {"value": firmware},
+        }
+    )
+
+
 @pytest.mark.asyncio
-async def test_duplicate_gateway_entries_stay_separate_devices(
+async def test_duplicate_gateway_entries_become_one_device(
     hass, entry, device, firmware
 ):
-    """Only the K40RF entry on the gateway's firmware gets its MACs."""
+    """Only the K40RF entry on the gateway's firmware is the gateway's device."""
     entry.add_to_hass(hass)
     coordinator, _ = _coordinator(hass, entry, device, firmware)
     registry = dr.async_get(hass)
@@ -2705,13 +2946,8 @@ async def test_duplicate_gateway_entries_stay_separate_devices(
         config_entry_id=entry.entry_id, **coordinator.device_info
     )
     coordinator.local_modules = _CS5800_MODULES
-    coordinator.local_gateway_identity = {
-        "/gateway/brand": "Bosch",
-        "/gateway/versionFirmware": "15.00.01",
-        "/gateway/versionHardware": "K40RF_v1",
-        "/gateway/eth/mac": "f0:4a:3d:00:00:20",
-        "/gateway/wifi/mac": "f0:4a:3d:00:00:21",
-    }
+    coordinator.local_gateway_identity = _cs5800_identity()
+    coordinator.local_data = _cs5800_poll()
 
     coordinator.async_sync_module_devices()
     coordinator.async_sync_module_devices()
@@ -2722,13 +2958,215 @@ async def test_duplicate_gateway_entries_stay_separate_devices(
         for d in dr.async_entries_for_config_entry(registry, entry.entry_id)
         if d.via_device_id == parent.id
     ]
-    assert len(modules) == 5
-    gateways = {d.sw_version: d for d in modules if d.model_id == "K40RF"}
-    assert set(gateways) == {"15.00", "15.00.01"}
-    assert gateways["15.00.01"].hw_version == "K40RF_v1"
-    assert gateways["15.00.01"].connections == {
+    assert len(modules) == 4
+    gateways = [d for d in modules if d.model_id == "K40RF"]
+    assert len(gateways) == 1
+    gateway = gateways[0]
+    assert gateway.sw_version == "15.00.01"
+    assert gateway.manufacturer == "Bosch"
+    assert gateway.hw_version == "K40RF_v1"
+    assert gateway.connections == {
         (dr.CONNECTION_NETWORK_MAC, "f0:4a:3d:00:00:20"),
         (dr.CONNECTION_NETWORK_MAC, "f0:4a:3d:00:00:21"),
     }
-    assert gateways["15.00"].connections == set()
-    assert gateways["15.00"].hw_version is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_device_survives_a_firmware_update(hass, entry, device, firmware):
+    """The running K40RF entry moving to another bus slot keeps the device."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    registry = dr.async_get(hass)
+    registry.async_get_or_create(
+        config_entry_id=entry.entry_id, **coordinator.device_info
+    )
+    coordinator.local_modules = _CS5800_MODULES
+    coordinator.local_gateway_identity = _cs5800_identity()
+    coordinator.local_data = _cs5800_poll("15.00.01")
+    coordinator.async_sync_module_devices()
+    before = _module_devices(hass, entry, coordinator)["K40RF"]
+
+    # The older slot now runs the gateway's firmware.
+    coordinator.local_data = _cs5800_poll("15.00")
+    coordinator.async_sync_module_devices()
+    after = _module_devices(hass, entry, coordinator)["K40RF"]
+
+    assert after.id == before.id
+    assert after.sw_version == "15.00"
+
+
+@pytest.mark.asyncio
+async def test_hardware_read_failure_keeps_the_inventory(hass, entry, device, firmware):
+    """The MACs are decoration: failing to read them never drops the modules."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, **coordinator.device_info
+    )
+    coordinator.local_client.async_get_modules = AsyncMock(return_value=_SPEC_MODULES)
+    coordinator.local_client.async_get_resources = AsyncMock(
+        side_effect=NotRespondingError("timeout")
+    )
+    coordinator.local_healthy = True
+
+    await coordinator._fetch_local_modules()
+
+    assert coordinator.local_modules == _SPEC_MODULES
+    assert coordinator._last_local_modules_fetch is not None
+    devices = _module_devices(hass, entry, coordinator)
+    assert set(devices) == {"XCU_THH", "XCU_SRH", "K40RF"}
+    assert devices["K40RF"].connections == set()
+
+
+@pytest.mark.asyncio
+async def test_module_devices_go_once_local_access_is_off(
+    hass, entry, device, firmware
+):
+    """Without local access nothing would ever update or remove them."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    registry = dr.async_get(hass)
+    registry.async_get_or_create(
+        config_entry_id=entry.entry_id, **coordinator.device_info
+    )
+    coordinator.local_modules = _SPEC_MODULES
+    coordinator.async_sync_module_devices()
+    assert len(_module_devices(hass, entry, coordinator)) == 3
+
+    cloud_only, _ = _coordinator(hass, entry, device, firmware, local=False)
+    cloud_only.async_sync_module_devices()
+
+    assert _module_devices(hass, entry, coordinator) == {}
+    assert registry.async_get_device(identifiers={(DOMAIN, coordinator.unique_id)})
+
+
+@pytest.mark.asyncio
+async def test_only_stale_module_devices_can_be_deleted(hass, entry, device, firmware):
+    """The appliance and listed modules stay; a module gone from it may go."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    registry = dr.async_get(hass)
+    parent = registry.async_get_or_create(
+        config_entry_id=entry.entry_id, **coordinator.device_info
+    )
+    coordinator.local_modules = _SPEC_MODULES
+    coordinator.async_sync_module_devices()
+    entry.runtime_data = [coordinator]
+    listed = _module_devices(hass, entry, coordinator)["XCU_SRH"]
+    stale = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, coordinator.module_device_identifier("99-9"))},
+    )
+    orphan = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "other-gateway-module-8-8")},
+    )
+
+    assert await async_remove_config_entry_device(hass, entry, parent) is False
+    assert await async_remove_config_entry_device(hass, entry, listed) is False
+    assert await async_remove_config_entry_device(hass, entry, stale) is True
+    assert await async_remove_config_entry_device(hass, entry, orphan) is True
+
+
+@pytest.mark.asyncio
+async def test_local_silent_status_is_discovered_and_tracks_gateway(
+    hass, entry, device, firmware
+):
+    """The read-only silent status appears only when served, as an enum."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    entities, pending = [], []
+    for candidate in _local_optional_candidates(coordinator, entry):
+        _add_or_defer(candidate, entities, pending)
+    assert not any(
+        e.entity_description.key == "local_silent_mode_status" for e in entities
+    )
+    added = []
+    _add_pending_sensors_later(coordinator, entry, pending, added.extend)
+    resource = "/system/powerConstraints/silentMode/status"
+    coordinator.local_data = _local_device(resources={resource: {"value": "active"}})
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    silent = [
+        e for e in added if e.entity_description.key == "local_silent_mode_status"
+    ]
+    assert len(silent) == 1
+    sensor = silent[0]
+    assert sensor.device_class == SensorDeviceClass.ENUM
+    assert sensor.options == ["active", "inactive"]
+    assert sensor.native_value == "active"
+
+    coordinator.local_data = _local_device(resources={resource: {"value": "inactive"}})
+    sensor.set_attr()
+    assert sensor.native_value == "inactive"
+    coordinator.local_healthy = False
+    assert not sensor.available
+
+
+@pytest.mark.asyncio
+async def test_module_bus_sensors_sit_on_sub_devices_and_discover_late_modules(
+    hass, entry, device, firmware
+):
+    """Fork-only: each module shows its bus address on its own sub-device."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    coordinator.local_healthy = True
+    coordinator.local_modules = _SPEC_MODULES[:2]
+    sensors = [
+        BoschComLocalModuleBusSensor(coordinator, key)
+        for key in coordinator.module_device_keys().values()
+    ]
+    outdoor = sensors[1]
+    assert outdoor.native_value == "65281 / 8"
+    assert outdoor.unique_id == f"{coordinator.unique_id}-module-65281-8-bus"
+    assert outdoor.device_info["identifiers"] == {
+        (DOMAIN, f"{coordinator.unique_id}-module-65281-8")
+    }
+    assert "8370374" not in outdoor.unique_id
+
+    added = []
+    _add_local_modules_later(coordinator, entry, added.extend)
+    coordinator.local_modules = _SPEC_MODULES
+    coordinator.async_update_listeners()
+    coordinator.async_update_listeners()
+    assert [s.native_value for s in added] == ["17 / 72"]
+    assert added[0].device_info["identifiers"] == {
+        (DOMAIN, f"{coordinator.unique_id}-module-gateway")
+    }
+
+    coordinator.local_modules = _SPEC_MODULES[1:]
+    assert outdoor.available
+    assert not sensors[0].available
+    coordinator.local_healthy = False
+    assert not outdoor.available
+
+
+@pytest.mark.asyncio
+async def test_module_bus_sensors_match_the_module_devices(
+    hass, entry, device, firmware
+):
+    """Fork-only: one bus sensor per sub-device, the gateway's on its device."""
+    entry.add_to_hass(hass)
+    coordinator, _ = _coordinator(hass, entry, device, firmware)
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, **coordinator.device_info
+    )
+    coordinator.local_healthy = True
+    coordinator.local_modules = _CS5800_MODULES
+    coordinator.local_gateway_identity = _cs5800_identity()
+    coordinator.local_data = _cs5800_poll("15.00.01")
+    coordinator.async_sync_module_devices()
+
+    sensors = [
+        BoschComLocalModuleBusSensor(coordinator, key)
+        for key in coordinator.module_device_keys().values()
+    ]
+    devices = {
+        identifier[1]
+        for d in _module_devices(hass, entry, coordinator).values()
+        for identifier in d.identifiers
+    }
+    assert {next(iter(s.device_info["identifiers"]))[1] for s in sensors} == devices
+    gateway = next(s for s in sensors if s.unique_id.endswith("-module-gateway-bus"))
+    assert gateway.native_value == "17 / 72"

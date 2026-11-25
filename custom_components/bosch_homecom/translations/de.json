@@ -25,7 +25,7 @@
         "title": "Authentifizierung"
       },
       "browser": {
-        "description": "Melden Sie sich im Browser über die [URL]({url}) in der Readme an und erfassen Sie den Code mit den Entwicklertools des Browsers.",
+        "description": "1. Öffnen Sie die [SingleKey-ID-Anmeldung]({url}) und melden Sie sich an. Danach scheint die Seite nichts zu tun; das ist so gewollt.\n2. Drücken Sie F12 und öffnen Sie den Reiter **Konsole**.\n3. Kopieren Sie die rote Zeile, die mit „Failed to launch“ beginnt, und fügen Sie sie unten ein. Die ganze URL oder nur der Code (endet auf -1) geht auch.\n\nDer Code gilt nur einmal und läuft schnell ab. Details und weitere Wege stehen in der README.",
         "data": {
           "code": "SingleKey ID Code"
         },
@@ -609,6 +609,18 @@
       "local_pump_volume_flow": {
         "name": "Pumpen-Volumenstrom"
       },
+      "local_primary_pump_volume_flow": {
+        "name": "Volumenstrom Wärmeerzeugerpumpe"
+      },
+      "local_heat_carrier_pump_speed": {
+        "name": "Drehzahl Wärmeerzeugerpumpe"
+      },
+      "local_heat_output": {
+        "name": "Wärmeleistung (Bosch-Berechnung)"
+      },
+      "local_hc1_flow_temp_setpoint": {
+        "name": "Vorlaufsollwert HK1"
+      },
       "local_starts_ch": {
         "name": "Starts Heizung"
       },
@@ -641,6 +653,33 @@
       },
       "bacon_humidity": {
         "name": "Luftfeuchtigkeit (zuletzt gemeldet)"
+      },
+      "bacon_energy_heat": {
+        "name": "Energieverbrauch Heizen"
+      },
+      "bacon_energy_cool": {
+        "name": "Energieverbrauch Kühlen"
+      },
+      "bacon_energy_dry": {
+        "name": "Energieverbrauch Entfeuchten"
+      },
+      "bacon_energy_fan": {
+        "name": "Energieverbrauch Lüften"
+      },
+      "bacon_thermal_energy_heat": {
+        "name": "Wärmeabgabe Heizen"
+      },
+      "bacon_thermal_energy_cool": {
+        "name": "Wärmeabgabe Kühlen"
+      },
+      "bacon_power": {
+        "name": "Leistung (zuletzt gemeldet)"
+      },
+      "bacon_outdoor_temperature": {
+        "name": "Außentemperatur (zuletzt gemeldet)"
+      },
+      "bacon_compressor_frequency": {
+        "name": "Verdichterfrequenz (zuletzt gemeldet)"
       },
       "hc_actual_supply_temp": {
         "name": "{circuit} Vorlauftemperatur"
@@ -801,6 +840,9 @@
       }
     },
     "binary_sensor": {
+      "local_primary_flow_low": {
+        "name": "Volumenstrom Wärmeerzeuger unter Messbereich"
+      },
       "wb_network": {
         "name": "Wallbox Netzwerk"
       },

@@ -21,6 +21,7 @@ from homeassistant.core import (
 from homeassistant.data_entry_flow import UnknownFlow
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -47,20 +48,25 @@ from homecom_alt import (
     InvalidSensorDataError,
     MqttNotAuthorizedError,
     NotRespondingError,
+    async_get_rac_history,
     decode_jwt_exp,
     decode_jwt_sub,
 )
+from homecom_alt.const import BACON_DEFAULT_REGION
 from tenacity import RetryError
 
 from .auth_diagnostics import short_fingerprint
 from .bacon import humanize_appliance_type
 from .const import (
+    BACON_HISTORY_INTERVAL,
     BACON_MODE_FIELDS,
+    BACON_RAC_TYPE,
     BACON_RECONNECT_MARGIN,
     BACON_RECONNECT_MIN_DELAY,
     BACON_TOPIC_META,
     BACON_TOPICS_PREFIX,
     CLOUD_AUTH_FAILURES_BEFORE_REFRESH,
+    CONF_BACON_REGION,
     CONF_BACON_TITLES,
     CONF_REFRESH,
     DEFAULT_UPDATE_INTERVAL,
@@ -77,8 +83,8 @@ from .const import (
     LOCAL_FLAME_STATUS,
     LOCAL_GATEWAY_BRAND,
     LOCAL_GATEWAY_FIRMWARE,
+    LOCAL_GATEWAY_HARDWARE,
     LOCAL_GATEWAY_HW_VERSION,
-    LOCAL_GATEWAY_IDENTITY,
     LOCAL_GATEWAY_MACS,
     LOCAL_HC_CIRCUIT,
     LOCAL_HC_KEYS,
@@ -98,6 +104,8 @@ from .const import (
     WDDW2_RECORDINGS_POLL_INTERVAL,
     WDDW2_WATER_TODAY_KEY,
 )
+from .diagnostics import _mask_serial
+from .statistics import async_import_energy, zero_only_store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -479,6 +487,10 @@ class _K40ExtraEndpointsMixin:
         # the previous day has been read since midnight (see _fetch_recordings).
         self._recordings_day: date | None = None
         self._previous_day_reads = 0
+        # The running statistics import, and the statistic ids of the counters
+        # served without any energy, loaded from their store by the first one.
+        self._statistics_task: asyncio.Task | None = None
+        self._statistics_zero_only: set[str] | None = None
         self._last_hc_tune_fetch = None
 
     async def _async_update_data(self):
@@ -629,6 +641,7 @@ class _K40ExtraEndpointsMixin:
         self._last_recordings_fetch = now
 
         complete = self._store_recordings(result or {}, day)
+        self._start_statistics_import(result or {}, day)
         if day == today:
             self._recordings_day = today
             return
@@ -639,6 +652,58 @@ class _K40ExtraEndpointsMixin:
             self._recordings_day = today
             self._previous_day_reads = 0
             self._last_recordings_fetch = None
+
+    def _start_statistics_import(self, result: dict, day: date) -> None:
+        """Run the statistics import as a background task.
+
+        The history requests of a first import then don't hold up the refresh.
+        While an import still runs, the next one is skipped: each fetch brings
+        the whole day again, and missed days are read back.
+        """
+        if "recorder" not in self.hass.config.components:
+            return
+        if self._statistics_task is not None and not self._statistics_task.done():
+            return
+        self._statistics_task = self.entry.async_create_background_task(
+            self.hass,
+            self._import_statistics(result, day),
+            name=f"{DOMAIN} energy statistics {self.unique_id}",
+        )
+
+    async def _import_statistics(self, result: dict, day: date) -> None:
+        """Add the energy recordings to the long-term statistics (statistics.py).
+
+        A failure only costs this hour's import: the next fetch catches up.
+        """
+        store = zero_only_store(self.hass, self.entry.entry_id, self.unique_id)
+        try:
+            if self._statistics_zero_only is None:
+                self._statistics_zero_only = set(await store.async_load() or [])
+            if await async_import_energy(
+                self.hass,
+                self.bhc,
+                self.unique_id,
+                result,
+                day,
+                self._statistics_zero_only,
+            ):
+                await store.async_save(sorted(self._statistics_zero_only))
+        except (
+            ApiError,
+            InvalidSensorDataError,
+            NotRespondingError,
+            RetryError,
+            TimeoutError,
+        ):
+            _LOGGER.debug(
+                "Device %s: energy statistics import failed, retrying next hour",
+                self.unique_id,
+            )
+        except Exception:
+            # Anything else is a bug: log it, and let the next fetch try again.
+            _LOGGER.exception(
+                "Device %s: energy statistics import failed", self.unique_id
+            )
 
     def _store_recordings(self, result: dict, day: date) -> bool:
         """Aggregate a bulk answer for ``day`` into ``recordings``.
@@ -729,6 +794,9 @@ def _async_update_registry_device(
         dr.async_get(hass).async_update_device(device.id, **changes)
 
 
+LOCAL_GATEWAY_DEVICE_KEY = "gateway"
+
+
 def local_module_key(module: BHCLocalModule, index: int) -> str:
     """Identify a gateway module by its bus address, stable across reordering.
 
@@ -739,6 +807,17 @@ def local_module_key(module: BHCLocalModule, index: int) -> str:
     if not identity:
         identity = [module.hw_ident or f"index-{index}"]
     return re.sub(r"[^a-zA-Z0-9_-]", "_", "-".join(identity))
+
+
+def _string_values(payloads: dict[str, Any]) -> dict[str, str]:
+    """Return the non-empty string ``value`` of each resource payload, by path."""
+    return {
+        path: value
+        for path, payload in payloads.items()
+        if isinstance(payload, dict)
+        and isinstance(value := payload.get("value"), str)
+        and value
+    }
 
 
 def _overlay_local(data: BHCDeviceK40, local: BHCDeviceK40Local | None) -> BHCDeviceK40:
@@ -915,8 +994,11 @@ class BoschComModuleCoordinatorK40(
         self.local_healthy = False
         # The gateway's module inventory, see _fetch_local_modules.
         self.local_modules: tuple[BHCLocalModule, ...] | None = None
-        # String values of LOCAL_GATEWAY_IDENTITY, by resource path.
+        # String values of the gateway's identity resources, by path: those of
+        # LOCAL_GATEWAY_HARDWARE, read with the inventory (see _gateway_identity).
         self.local_gateway_identity: dict[str, str] = {}
+        # Registry identifiers of the module devices of the latest sync.
+        self._module_identifiers: set[tuple[str, str]] = set()
         self._last_local_modules_fetch: datetime | None = None
         self._cloud_failures = 0
         # Consecutive cloud 401s from the update itself, see
@@ -1153,9 +1235,6 @@ class BoschComModuleCoordinatorK40(
             return
         try:
             modules = await self.local_client.async_get_modules()
-            identity = await self.local_client.async_get_resources(
-                LOCAL_GATEWAY_IDENTITY
-            )
         except (ApiError, AuthFailedError, NotRespondingError, TimeoutError) as error:
             _LOGGER.debug(
                 "Device_Id: %s, reading the gateway's module inventory failed: %s",
@@ -1164,11 +1243,7 @@ class BoschComModuleCoordinatorK40(
             )
             return
         self._last_local_modules_fetch = now
-        self.local_gateway_identity = {
-            path: value
-            for path, payload in identity.items()
-            if isinstance(value := payload.get("value"), str) and value
-        }
+        await self._fetch_local_gateway_hardware()
         if modules is None:
             return
         self.local_modules = modules
@@ -1194,9 +1269,100 @@ class BoschComModuleCoordinatorK40(
             self.hass, self.entry, self.unique_id, model=model
         )
 
-    def module_device_identifier(self, module: BHCLocalModule, index: int) -> str:
+    async def _fetch_local_gateway_hardware(self) -> None:
+        """Read the gateway's hardware version and MACs, best effort.
+
+        Only decorates the gateway's module device: a failure keeps the values
+        read before and never holds up the inventory.
+        """
+        try:
+            payloads = await self.local_client.async_get_resources(
+                LOCAL_GATEWAY_HARDWARE
+            )
+        except (ApiError, AuthFailedError, NotRespondingError, TimeoutError) as error:
+            _LOGGER.debug(
+                "Device_Id: %s, reading the gateway's hardware identity failed: %s",
+                self.unique_id,
+                error,
+            )
+            return
+        self.local_gateway_identity = _string_values(payloads)
+
+    def _gateway_identity(self) -> dict[str, str]:
+        """Return the gateway's identity: hardware, plus brand and firmware.
+
+        Brand and firmware come with every local poll, so they are not read
+        again with the inventory.
+        """
+        resources = getattr(self.local_data, "resources", None) or {}
+        polled = _string_values(
+            {
+                path: resources[path]
+                for path in (LOCAL_GATEWAY_BRAND, LOCAL_GATEWAY_FIRMWARE)
+                if path in resources
+            }
+        )
+        return {**self.local_gateway_identity, **polled}
+
+    @property
+    def _module_device_prefix(self) -> str:
+        return f"{self.unique_id}-module-"
+
+    def module_device_identifier(self, key: str) -> str:
         """Registry identifier of a module's sub-device."""
-        return f"{self.unique_id}-module-{local_module_key(module, index)}"
+        return f"{self._module_device_prefix}{key}"
+
+    def module_device_removable(self, device: dr.DeviceEntry) -> bool | None:
+        """Tell whether ``device`` is one of this appliance's module devices
+        that the gateway no longer lists. None when it is not a module device
+        of this appliance.
+        """
+        ours = {
+            i
+            for i in device.identifiers
+            if i[0] == DOMAIN and i[1].startswith(self._module_device_prefix)
+        }
+        if not ours:
+            return None
+        return not ours & self._module_identifiers
+
+    @callback
+    def _async_detach_module_devices(self, keep: set[tuple[str, str]]) -> None:
+        """Detach this entry from the appliance's module devices not in ``keep``."""
+        registry = dr.async_get(self.hass)
+        for device in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
+            if self.module_device_removable(device) is None:
+                continue
+            ours = {i for i in device.identifiers if i[0] == DOMAIN}
+            if not ours & keep:
+                registry.async_update_device(
+                    device.id, remove_config_entry_id=self.entry.entry_id
+                )
+
+    def module_device_keys(self) -> dict[int, str]:
+        """Device key of each inventory entry that gets a module device, by index.
+
+        The running gateway is keyed ``gateway`` whatever its bus address, so a
+        firmware update that moves the running entry keeps the device. Its
+        other listings (an older firmware slot) are not modules of their own
+        and get no key.
+        """
+        modules = self.local_modules or ()
+        firmware = self._gateway_identity().get(LOCAL_GATEWAY_FIRMWARE)
+        gateways = [m for m in modules if m.is_gateway]
+        own_gateway = next(
+            (m for m in gateways if m.version == firmware),
+            gateways[0] if gateways else None,
+        )
+        return {
+            index: (
+                LOCAL_GATEWAY_DEVICE_KEY
+                if module is own_gateway
+                else local_module_key(module, index)
+            )
+            for index, module in enumerate(modules)
+            if module is own_gateway or not module.is_gateway
+        }
 
     @callback
     def async_sync_module_devices(self) -> None:
@@ -1205,33 +1371,37 @@ class BoschComModuleCoordinatorK40(
         A heat pump is several modules (indoor unit, outdoor unit, gateway),
         each with its own model and firmware; the registry shows them on their
         own device pages. Modules gone from the latest inventory lose this
-        entry. Waits for the appliance's device, which setup creates after the
-        first refresh; setup calls this again then.
+        entry, and all of them do once local access is off. Waits for the
+        appliance's device, which setup creates after the first refresh; setup
+        calls this again then.
         """
+        if self.local_client is None:
+            self._module_identifiers = set()
+            self._async_detach_module_devices(keep=set())
+            return
         modules = self.local_modules
         parent = _async_registry_device(self.hass, self.entry, self.unique_id)
         if modules is None or parent is None:
             return
         registry = dr.async_get(self.hass)
-        identity = self.local_gateway_identity
-        gateways = [m for m in modules if m.is_gateway]
-        own_gateway = next(
-            (m for m in gateways if m.version == identity.get(LOCAL_GATEWAY_FIRMWARE)),
-            gateways[0] if gateways else None,
-        )
-        current = set()
+        identity = self._gateway_identity()
+        keys = self.module_device_keys()
+        current: set[tuple[str, str]] = set()
         for index, module in enumerate(modules):
-            identifier = (DOMAIN, self.module_device_identifier(module, index))
-            current.add(identifier)
+            if (key := keys.get(index)) is None:
+                continue
             gateway: dict[str, Any] = {}
-            # One device only: a MAC on two would merge them in the registry.
-            if module is own_gateway:
+            if key == LOCAL_GATEWAY_DEVICE_KEY:
+                # The MACs go on this device only: on two they would merge them
+                # in the registry.
                 gateway["hw_version"] = identity.get(LOCAL_GATEWAY_HW_VERSION)
                 gateway["connections"] = {
                     (dr.CONNECTION_NETWORK_MAC, dr.format_mac(mac))
                     for path in LOCAL_GATEWAY_MACS
                     if (mac := identity.get(path)) and mac.strip("0:")
                 }
+            identifier = (DOMAIN, self.module_device_identifier(key))
+            current.add(identifier)
             # Linked by update: async_get_or_create's via_device is
             # deprecated in 2026.11, and via_device_id there is too new.
             device = registry.async_get_or_create(
@@ -1247,17 +1417,8 @@ class BoschComModuleCoordinatorK40(
             )
             if device.via_device_id != parent.id:
                 registry.async_update_device(device.id, via_device_id=parent.id)
-        prefix = f"{self.unique_id}-module-"
-        for device in dr.async_entries_for_config_entry(registry, self.entry.entry_id):
-            ours = {
-                i
-                for i in device.identifiers
-                if i[0] == DOMAIN and i[1].startswith(prefix)
-            }
-            if ours and not ours & current:
-                registry.async_update_device(
-                    device.id, remove_config_entry_id=self.entry.entry_id
-                )
+        self._module_identifiers = current
+        self._async_detach_module_devices(keep=current)
 
     def _local_data_or_fail(
         self, local: BHCDeviceK40Local | None, cloud_error: str
@@ -1268,8 +1429,10 @@ class BoschComModuleCoordinatorK40(
         heat demand, DHW and heating-circuit status) keep updating. Values only
         the cloud has keep their last state for ``MAX_CLOUD_FAILURES_WITH_LOCAL``
         polls and are empty after that, or straight away when there is no
-        cloud data yet (setup without the cloud). Without local data the
-        refresh fails as before.
+        cloud data yet (setup without the cloud, or the cloud failing the first
+        refresh). In that last case the entry reloads once the cloud answers,
+        so the cloud-only entities get created. Without local data the refresh
+        fails as before.
         """
         if local is None:
             self._async_notify_local_listeners()
@@ -1279,6 +1442,13 @@ class BoschComModuleCoordinatorK40(
         ):
             base = self.data
         else:
+            if self.data is None:
+                # No cloud data yet: the cloud failed the first refresh although
+                # the token worked (a 504 burst while Home Assistant starts).
+                # The platforms create their entities from this skeleton, so the
+                # cloud-only ones would stay missing until the entry is reloaded.
+                # Reload once the cloud answers, as after a setup without it.
+                self.cloud_setup_pending = True
             if self._cloud_failures == MAX_CLOUD_FAILURES_WITH_LOCAL + 1:
                 _LOGGER.warning(
                     "Device_Id: %s, no cloud data for %s polls (%s); showing "
@@ -1518,6 +1688,8 @@ class BoschComModuleCoordinatorRrc2(BoschComModuleCoordinatorBase[BHCDeviceRrc2]
             devices=data.devices,
             gateway_info=data.gateway_info,
             system_location=data.system_location,
+            energy_history=data.energy_history,
+            hourly_energy_history=data.hourly_energy_history,
         )
 
 
@@ -1584,6 +1756,9 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
         self._lock = lock
         self.auth_provider = auth_provider
         self.unique_id = device["deviceId"]
+        # The serial is the device's identity on Bosch's backend and logs end
+        # up in public issues: log a masked form, as diagnostics does.
+        self.log_id = _mask_serial(self.unique_id)
         self.device = device
         self.entry = entry
         self.firmware = firmware["value"]
@@ -1611,6 +1786,13 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
         # first, so until the new meta arrives the cached one describes the mode
         # the unit just left. Entities must not block a write on it (#164).
         self.meta_stale = False
+
+        # Energy totals and extended readings from the history service (#202),
+        # ACs only. Read in the background every BACON_HISTORY_INTERVAL; a
+        # failed read keeps the last answer.
+        self._history: dict | None = None
+        self._history_next: datetime | None = None
+        self._history_task: asyncio.Task | None = None
 
         client.register_listener(self.unique_id, self._handle_push)
         client.register_raw_listener(self._handle_topic)
@@ -1695,7 +1877,56 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
             sensor=self.bhc.sensor,
             metadata=self.bhc.metadata,
             info=info,
+            history=self._history,
         )
+
+    @callback
+    def _schedule_history_refresh(self) -> None:
+        """Start a history read in the background when one is due.
+
+        Kept off the poll on purpose: the shadow read must neither wait for nor
+        fail with a second backend. Entities pick the result up through
+        async_set_updated_data when the read lands.
+        """
+        if self.device.get("deviceType") != BACON_RAC_TYPE:
+            return
+        if self._history_task is not None and not self._history_task.done():
+            return
+        now = dt_util.utcnow()
+        if self._history_next is not None and now < self._history_next:
+            return
+        # Also on failure: the next try waits a full interval.
+        self._history_next = now + BACON_HISTORY_INTERVAL
+        self._history_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_refresh_history(),
+            name=f"{DOMAIN} bacon history {self.unique_id}",
+        )
+
+    async def _async_refresh_history(self) -> None:
+        """Read the energy totals and the newest extended record.
+
+        Uses the token the MQTT session and the presence heartbeat use, as is:
+        no refresh is triggered from here, and every failure (a 401 included,
+        the library raises only ApiError) is logged and dropped, so this read
+        can never start a re-authentication.
+        """
+        token = self.token_manager.token or self.entry.data.get(CONF_TOKEN)
+        if not token:
+            return
+        region = self.entry.data.get(CONF_BACON_REGION) or BACON_DEFAULT_REGION
+        try:
+            history = await async_get_rac_history(
+                async_get_clientsession(self.hass), token, self.unique_id, region
+            )
+        except ApiError as err:
+            _LOGGER.debug(
+                "Device_Id: %s, bacon history read failed: %s", self.log_id, err
+            )
+            return
+        self._history = history
+        if self.data is not None:
+            self.async_set_updated_data(self._build({}))
 
     def _sync_versions(self, info: dict | None) -> None:
         """Put the gateway's firmware and hardware versions on the device.
@@ -1742,7 +1973,7 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
         new_data[CONF_TOKEN] = self.token_manager.token
         new_data[CONF_REFRESH] = self.token_manager.refresh_token
         self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-        _LOGGER.debug("Device_Id: %s, persisted refreshed auth tokens", self.unique_id)
+        _LOGGER.debug("Device_Id: %s, persisted refreshed auth tokens", self.log_id)
 
     async def _async_session_token(self, *, force_refresh: bool = False) -> str | None:
         """Return the access token to open the MQTT session with.
@@ -1844,7 +2075,7 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
                     return
                 _LOGGER.debug(
                     "Device_Id: %s, reconnecting bacon MQTT ahead of token expiry",
-                    self.unique_id,
+                    self.log_id,
                 )
                 await self._async_connect(token)
         except (
@@ -1859,7 +2090,7 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
             # here only costs the head start.
             _LOGGER.debug(
                 "Device_Id: %s, scheduled bacon reconnect failed: %s",
-                self.unique_id,
+                self.log_id,
                 err,
             )
         finally:
@@ -1889,7 +2120,7 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
             except MqttNotAuthorizedError:
                 _LOGGER.debug(
                     "Device_Id: %s, bacon MQTT refused the token, forcing a refresh",
-                    self.unique_id,
+                    self.log_id,
                 )
                 token = await self._async_session_token(force_refresh=True)
                 try:
@@ -1918,6 +2149,10 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
             TimeoutError,
         ) as err:
             raise UpdateFailed(err) from err
+        # Before _build: a read that completes eagerly (no I/O wait) is then in
+        # this poll's data; one that suspends lands later via
+        # async_set_updated_data.
+        self._schedule_history_refresh()
         data = self._build(state)
         self._async_withdraw_reauth()
         return data
@@ -1953,5 +2188,5 @@ class BoschComModuleCoordinatorBaconRac(DataUpdateCoordinator[BHCDeviceBacon]):
             )
             _LOGGER.debug(
                 "Device_Id: %s, withdrew stale re-authentication request",
-                self.unique_id,
+                self.log_id,
             )
